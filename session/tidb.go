@@ -23,23 +23,21 @@ import (
 	"sync"
 	"time"
 
-	"github.com/juju/errors"
-	"github.com/opentracing/opentracing-go"
-	"github.com/pingcap/tidb/ast"
+	"github.com/pingcap/parser"
+	"github.com/pingcap/parser/ast"
+	"github.com/pingcap/parser/mysql"
+	"github.com/pingcap/parser/terror"
 	"github.com/pingcap/tidb/config"
 	"github.com/pingcap/tidb/domain"
 	"github.com/pingcap/tidb/executor"
 	"github.com/pingcap/tidb/kv"
-	"github.com/pingcap/tidb/parser"
 	"github.com/pingcap/tidb/sessionctx"
-	"github.com/pingcap/tidb/terror"
-	"github.com/pingcap/tidb/types"
 	"github.com/pingcap/tidb/util"
 	"github.com/pingcap/tidb/util/chunk"
+	"github.com/pingcap/tidb/util/sqlexec"
+	"github.com/pkg/errors"
 	log "github.com/sirupsen/logrus"
 	"golang.org/x/net/context"
-	"google.golang.org/grpc"
-	"google.golang.org/grpc/credentials"
 )
 
 type domainMap struct {
@@ -106,9 +104,6 @@ var (
 
 	// statsLease is the time for reload stats table.
 	statsLease = 3 * time.Second
-
-	// The maximum number of retries to recover from retryable errors.
-	commitRetryLimit uint = 10
 )
 
 // SetSchemaLease changes the default schema lease time for DDL.
@@ -121,15 +116,6 @@ func SetSchemaLease(lease time.Duration) {
 // SetStatsLease changes the default stats lease time for loading stats info.
 func SetStatsLease(lease time.Duration) {
 	statsLease = lease
-}
-
-// SetCommitRetryLimit setups the maximum number of retries when trying to recover
-// from retryable errors.
-// Retryable errors are generally refer to temporary errors that are expected to be
-// reinstated by retry, including network interruption, transaction conflicts, and
-// so on.
-func SetCommitRetryLimit(limit uint) {
-	commitRetryLimit = limit
 }
 
 // Parse parses a query string to raw ast.StmtNode.
@@ -147,23 +133,18 @@ func Parse(ctx sessionctx.Context, src string) ([]ast.StmtNode, error) {
 }
 
 // Compile is safe for concurrent use by multiple goroutines.
-func Compile(ctx context.Context, sctx sessionctx.Context, stmtNode ast.StmtNode) (ast.Statement, error) {
+func Compile(ctx context.Context, sctx sessionctx.Context, stmtNode ast.StmtNode) (sqlexec.Statement, error) {
 	compiler := executor.Compiler{Ctx: sctx}
 	stmt, err := compiler.Compile(ctx, stmtNode)
 	return stmt, errors.Trace(err)
 }
 
-// runStmt executes the ast.Statement and commit or rollback the current transaction.
-func runStmt(ctx context.Context, sctx sessionctx.Context, s ast.Statement) (ast.RecordSet, error) {
-	span, ctx1 := opentracing.StartSpanFromContext(ctx, "runStmt")
-	span.LogKV("sql", s.OriginText())
-	defer span.Finish()
-
+// runStmt executes the sqlexec.Statement and commit or rollback the current transaction.
+func runStmt(ctx context.Context, sctx sessionctx.Context, s sqlexec.Statement) (sqlexec.RecordSet, error) {
 	var err error
-	var rs ast.RecordSet
+	var rs sqlexec.RecordSet
 	se := sctx.(*session)
 	rs, err = s.Exec(ctx)
-	span.SetTag("txn.id", se.sessionVars.TxnCtx.StartTS)
 	// All the history should be added here.
 	se.GetSessionVars().TxnCtx.StatementCount++
 	if !s.IsReadOnly() {
@@ -181,17 +162,17 @@ func runStmt(ctx context.Context, sctx sessionctx.Context, s ast.Statement) (ast
 	if !se.sessionVars.InTxn() {
 		if err != nil {
 			log.Info("RollbackTxn for ddl/autocommit error.")
-			err1 := se.RollbackTxn(ctx1)
+			err1 := se.RollbackTxn(ctx)
 			terror.Log(errors.Trace(err1))
 		} else {
-			err = se.CommitTxn(ctx1)
+			err = se.CommitTxn(ctx)
 		}
 	} else {
 		// If the user insert, insert, insert ... but never commit, TiDB would OOM.
 		// So we limit the statement count in a transaction here.
 		history := GetHistory(sctx)
 		if history.Count() > int(config.GetGlobalConfig().Performance.StmtCountLimit) {
-			err1 := se.RollbackTxn(ctx1)
+			err1 := se.RollbackTxn(ctx)
 			terror.Log(errors.Trace(err1))
 			return rs, errors.Errorf("statement count %d exceeds the transaction limitation, autocommit = %t",
 				history.Count(), sctx.GetSessionVars().IsAutocommit())
@@ -212,14 +193,14 @@ func GetHistory(ctx sessionctx.Context) *StmtHistory {
 }
 
 // GetRows4Test gets all the rows from a RecordSet, only used for test.
-func GetRows4Test(ctx context.Context, sctx sessionctx.Context, rs ast.RecordSet) ([]types.Row, error) {
+func GetRows4Test(ctx context.Context, sctx sessionctx.Context, rs sqlexec.RecordSet) ([]chunk.Row, error) {
 	if rs == nil {
 		return nil, nil
 	}
-	var rows []types.Row
+	var rows []chunk.Row
+	chk := rs.NewChunk()
 	for {
 		// Since we collect all the rows, we can not reuse the chunk.
-		chk := rs.NewChunk()
 		iter := chunk.NewIterator4Chunk(chk)
 
 		err := rs.Next(ctx, chk)
@@ -233,6 +214,7 @@ func GetRows4Test(ctx context.Context, sctx sessionctx.Context, rs ast.RecordSet
 		for row := iter.Begin(); row != iter.End(); row = iter.Next() {
 			rows = append(rows, row)
 		}
+		chk = chunk.Renew(chk, sctx.GetSessionVars().MaxChunkSize)
 	}
 	return rows, nil
 }
@@ -283,33 +265,6 @@ func newStoreWithRetry(path string, maxRetries int) (kv.Storage, error) {
 	return s, errors.Trace(err)
 }
 
-// DialPumpClientWithRetry tries to dial to binlogSocket,
-// if any error happens, it will try to re-dial,
-// or return this error when timeout.
-func DialPumpClientWithRetry(binlogSocket string, maxRetries int, dialerOpt grpc.DialOption) (*grpc.ClientConn, error) {
-	var clientCon *grpc.ClientConn
-	err := util.RunWithRetry(maxRetries, util.RetryInterval, func() (bool, error) {
-		log.Infof("setup binlog client")
-		var err error
-		tlsConfig, err := config.GetGlobalConfig().Security.ToTLSConfig()
-		if err != nil {
-			log.Infof("error happen when setting binlog client: %s", errors.ErrorStack(err))
-		}
-
-		if tlsConfig != nil {
-			clientCon, err = grpc.Dial(binlogSocket, grpc.WithTransportCredentials(credentials.NewTLS(tlsConfig)), dialerOpt)
-		} else {
-			clientCon, err = grpc.Dial(binlogSocket, grpc.WithInsecure(), dialerOpt)
-		}
-
-		if err != nil {
-			log.Infof("error happen when setting binlog client: %s", errors.ErrorStack(err))
-		}
-		return true, errors.Trace(err)
-	})
-	return clientCon, errors.Trace(err)
-}
-
 var queryStmtTable = []string{"explain", "select", "show", "execute", "describe", "desc", "admin"}
 
 func trimSQL(sql string) string {
@@ -342,5 +297,18 @@ func IsQuery(sql string) bool {
 	return false
 }
 
+var (
+	errForUpdateCantRetry = terror.ClassSession.New(codeForUpdateCantRetry,
+		mysql.MySQLErrName[mysql.ErrForUpdateCantRetry])
+)
+
+const (
+	codeForUpdateCantRetry terror.ErrCode = mysql.ErrForUpdateCantRetry
+)
+
 func init() {
+	sessionMySQLErrCodes := map[terror.ErrCode]uint16{
+		codeForUpdateCantRetry: mysql.ErrForUpdateCantRetry,
+	}
+	terror.ErrClassToMySQLCodes[terror.ClassSession] = sessionMySQLErrCodes
 }

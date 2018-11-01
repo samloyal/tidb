@@ -21,31 +21,40 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"io/ioutil"
 	"net/http"
+	"net/url"
 	"sort"
+	"sync/atomic"
 	"time"
 
 	. "github.com/pingcap/check"
 	"github.com/pingcap/kvproto/pkg/kvrpcpb"
+	"github.com/pingcap/parser/model"
+	"github.com/pingcap/parser/mysql"
 	"github.com/pingcap/tidb/config"
 	"github.com/pingcap/tidb/domain"
 	"github.com/pingcap/tidb/kv"
 	"github.com/pingcap/tidb/meta"
-	"github.com/pingcap/tidb/model"
-	"github.com/pingcap/tidb/mysql"
 	"github.com/pingcap/tidb/session"
 	"github.com/pingcap/tidb/sessionctx"
 	"github.com/pingcap/tidb/sessionctx/stmtctx"
+	"github.com/pingcap/tidb/sessionctx/variable"
 	"github.com/pingcap/tidb/store/mockstore"
 	"github.com/pingcap/tidb/store/mockstore/mocktikv"
 	"github.com/pingcap/tidb/store/tikv"
 	"github.com/pingcap/tidb/tablecodec"
 	"github.com/pingcap/tidb/types"
 	"github.com/pingcap/tidb/util/codec"
+	"github.com/pingcap/tidb/util/printer"
+	log "github.com/sirupsen/logrus"
 )
 
 type HTTPHandlerTestSuite struct {
-	server *Server
+	server  *Server
+	store   kv.Storage
+	domain  *domain.Domain
+	tidbdrv *TiDBDriver
 }
 
 var _ = Suite(new(HTTPHandlerTestSuite))
@@ -62,7 +71,11 @@ func (ts *HTTPHandlerTestSuite) TestRegionIndexRange(c *C) {
 	}
 	var expectIndexValues []string
 	for _, v := range indexValues {
-		expectIndexValues = append(expectIndexValues, fmt.Sprintf("%d-%v", v.Kind(), v.GetValue()))
+		str, err := v.ToString()
+		if err != nil {
+			str = fmt.Sprintf("%d-%v", v.Kind(), v.GetValue())
+		}
+		expectIndexValues = append(expectIndexValues, str)
 	}
 	encodedValue, err := codec.EncodeKey(&stmtctx.StatementContext{TimeZone: time.Local}, nil, indexValues...)
 	c.Assert(err, IsNil)
@@ -226,11 +239,12 @@ func (ts *HTTPHandlerTestSuite) TestRegionsFromMeta(c *C) {
 
 func (ts *HTTPHandlerTestSuite) startServer(c *C) {
 	mvccStore := mocktikv.MustNewMVCCStore()
-	store, err := mockstore.NewMockTikvStore(mockstore.WithMVCCStore(mvccStore))
+	var err error
+	ts.store, err = mockstore.NewMockTikvStore(mockstore.WithMVCCStore(mvccStore))
 	c.Assert(err, IsNil)
-	_, err = session.BootstrapSession(store)
+	ts.domain, err = session.BootstrapSession(ts.store)
 	c.Assert(err, IsNil)
-	tidbdrv := NewTiDBDriver(store)
+	ts.tidbdrv = NewTiDBDriver(ts.store)
 
 	cfg := config.NewConfig()
 	cfg.Port = 4001
@@ -238,7 +252,7 @@ func (ts *HTTPHandlerTestSuite) startServer(c *C) {
 	cfg.Status.StatusPort = 10090
 	cfg.Status.ReportStatus = true
 
-	server, err := NewServer(cfg, tidbdrv)
+	server, err := NewServer(cfg, ts.tidbdrv)
 	c.Assert(err, IsNil)
 	ts.server = server
 	go server.Run()
@@ -246,6 +260,12 @@ func (ts *HTTPHandlerTestSuite) startServer(c *C) {
 }
 
 func (ts *HTTPHandlerTestSuite) stopServer(c *C) {
+	if ts.domain != nil {
+		ts.domain.Close()
+	}
+	if ts.store != nil {
+		ts.store.Close()
+	}
 	if ts.server != nil {
 		ts.server.Close()
 	}
@@ -402,7 +422,7 @@ func (ts *HTTPHandlerTestSuite) TestDecodeColumnValue(c *C) {
 		var data interface{}
 		err = decoder.Decode(&data)
 		c.Assert(err, IsNil, Commentf("url:%v\ndata%v", url, data))
-		colVal, err := types.DatumsToString([]types.Datum{row[col.id-1]})
+		colVal, err := types.DatumsToString([]types.Datum{row[col.id-1]}, false)
 		c.Assert(err, IsNil)
 		c.Assert(data, Equals, colVal, Commentf("url:%v", url))
 	}
@@ -577,4 +597,113 @@ func (ts *HTTPHandlerTestSuite) TestAllHistory(c *C) {
 
 	c.Assert(err, IsNil)
 	c.Assert(jobs, DeepEquals, data)
+}
+
+func (ts *HTTPHandlerTestSuite) TestPostSettings(c *C) {
+	ts.startServer(c)
+	ts.prepareData(c)
+	defer ts.stopServer(c)
+	form := make(url.Values)
+	form.Set("log_level", "error")
+	form.Set("tidb_general_log", "1")
+	resp, err := http.PostForm("http://127.0.0.1:10090/settings", form)
+	c.Assert(err, IsNil)
+	c.Assert(resp.StatusCode, Equals, http.StatusOK)
+	c.Assert(log.GetLevel(), Equals, log.ErrorLevel)
+	c.Assert(config.GetGlobalConfig().Log.Level, Equals, "error")
+	c.Assert(atomic.LoadUint32(&variable.ProcessGeneralLog), Equals, uint32(1))
+	form = make(url.Values)
+	form.Set("log_level", "info")
+	form.Set("tidb_general_log", "0")
+	resp, err = http.PostForm("http://127.0.0.1:10090/settings", form)
+	c.Assert(err, IsNil)
+	c.Assert(resp.StatusCode, Equals, http.StatusOK)
+	c.Assert(atomic.LoadUint32(&variable.ProcessGeneralLog), Equals, uint32(0))
+	c.Assert(log.GetLevel(), Equals, log.InfoLevel)
+	c.Assert(config.GetGlobalConfig().Log.Level, Equals, "info")
+
+	// test ddl_slow_threshold
+	form = make(url.Values)
+	form.Set("ddl_slow_threshold", "200")
+	resp, err = http.PostForm("http://127.0.0.1:10090/settings", form)
+	c.Assert(err, IsNil)
+	c.Assert(resp.StatusCode, Equals, http.StatusOK)
+	c.Assert(atomic.LoadUint32(&variable.DDLSlowOprThreshold), Equals, uint32(200))
+}
+
+func (ts *HTTPHandlerTestSuite) TestPprof(c *C) {
+	ts.startServer(c)
+	defer ts.stopServer(c)
+	retryTime := 100
+	for retry := 0; retry < retryTime; retry++ {
+		resp, err := http.Get("http://127.0.0.1:10090/debug/pprof/heap")
+		if err == nil {
+			ioutil.ReadAll(resp.Body)
+			resp.Body.Close()
+			return
+		}
+		time.Sleep(time.Millisecond * 10)
+	}
+	log.Fatalf("Failed to get profile for %d retries in every 10 ms", retryTime)
+}
+
+func (ts *HTTPHandlerTestSuite) TestServerInfo(c *C) {
+	ts.startServer(c)
+	defer ts.stopServer(c)
+	resp, err := http.Get("http://127.0.0.1:10090/info")
+	c.Assert(err, IsNil)
+	defer resp.Body.Close()
+	c.Assert(resp.StatusCode, Equals, http.StatusOK)
+	decoder := json.NewDecoder(resp.Body)
+
+	info := serverInfo{}
+	err = decoder.Decode(&info)
+	c.Assert(err, IsNil)
+
+	cfg := config.GetGlobalConfig()
+	c.Assert(info.IsOwner, IsTrue)
+	c.Assert(info.IP, Equals, cfg.AdvertiseAddress)
+	c.Assert(info.StatusPort, Equals, cfg.Status.StatusPort)
+	c.Assert(info.Lease, Equals, cfg.Lease)
+	c.Assert(info.Version, Equals, mysql.ServerVersion)
+	c.Assert(info.GitHash, Equals, printer.TiDBGitHash)
+
+	store := ts.server.newTikvHandlerTool().store.(kv.Storage)
+	do, err := session.GetDomain(store.(kv.Storage))
+	c.Assert(err, IsNil)
+	ddl := do.DDL()
+	c.Assert(info.ID, Equals, ddl.GetID())
+}
+
+func (ts *HTTPHandlerTestSuite) TestAllServerInfo(c *C) {
+	ts.startServer(c)
+	defer ts.stopServer(c)
+	resp, err := http.Get("http://127.0.0.1:10090/info/all")
+	c.Assert(err, IsNil)
+	defer resp.Body.Close()
+	c.Assert(resp.StatusCode, Equals, http.StatusOK)
+	decoder := json.NewDecoder(resp.Body)
+
+	clusterInfo := clusterServerInfo{}
+	err = decoder.Decode(&clusterInfo)
+	c.Assert(err, IsNil)
+
+	c.Assert(clusterInfo.IsAllServerVersionConsistent, IsTrue)
+	c.Assert(clusterInfo.ServersNum, Equals, 1)
+
+	store := ts.server.newTikvHandlerTool().store.(kv.Storage)
+	do, err := session.GetDomain(store.(kv.Storage))
+	c.Assert(err, IsNil)
+	ddl := do.DDL()
+	c.Assert(clusterInfo.OwnerID, Equals, ddl.GetID())
+	serverInfo, ok := clusterInfo.AllServersInfo[ddl.GetID()]
+	c.Assert(ok, Equals, true)
+
+	cfg := config.GetGlobalConfig()
+	c.Assert(serverInfo.IP, Equals, cfg.AdvertiseAddress)
+	c.Assert(serverInfo.StatusPort, Equals, cfg.Status.StatusPort)
+	c.Assert(serverInfo.Lease, Equals, cfg.Lease)
+	c.Assert(serverInfo.Version, Equals, mysql.ServerVersion)
+	c.Assert(serverInfo.GitHash, Equals, printer.TiDBGitHash)
+	c.Assert(serverInfo.ID, Equals, ddl.GetID())
 }

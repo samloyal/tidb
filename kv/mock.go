@@ -14,8 +14,8 @@
 package kv
 
 import (
-	"github.com/juju/errors"
 	"github.com/pingcap/tidb/store/tikv/oracle"
+	"github.com/pkg/errors"
 	"golang.org/x/net/context"
 )
 
@@ -111,6 +111,10 @@ func (t *mockTxn) SetCap(cap int) {
 
 func (t *mockTxn) Reset() {
 	t.valid = false
+}
+
+func (t *mockTxn) SetVars(vars *Variables) {
+
 }
 
 // NewMockTxn new a mockTxn.

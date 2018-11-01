@@ -34,19 +34,19 @@ var (
 			Buckets:   prometheus.ExponentialBuckets(0.01, 2, 20),
 		}, []string{LblType, LblResult})
 
-	BatchAddIdxHistogram = prometheus.NewHistogram(
+	BatchAddIdxHistogram = prometheus.NewHistogramVec(
 		prometheus.HistogramOpts{
 			Namespace: "tidb",
 			Subsystem: "ddl",
 			Name:      "batch_add_idx_duration_seconds",
 			Help:      "Bucketed histogram of processing time (s) of batch handle data",
 			Buckets:   prometheus.ExponentialBuckets(0.001, 2, 20),
-		})
+		}, []string{LblType})
 
-	SyncerInit    = "init"
-	SyncerRestart = "restart"
-	SyncerClear   = "clear"
-
+	SyncerInit            = "init"
+	SyncerRestart         = "restart"
+	SyncerClear           = "clear"
+	SyncerRewatch         = "rewatch"
 	DeploySyncerHistogram = prometheus.NewHistogramVec(
 		prometheus.HistogramOpts{
 			Namespace: "tidb",
@@ -79,6 +79,7 @@ var (
 
 	// Metrics for ddl_worker.go.
 	WorkerAddDDLJob         = "add_job"
+	WorkerRunDDLJob         = "run_job"
 	WorkerFinishDDLJob      = "finish_job"
 	WorkerWaitSchemaChanged = "wait_schema_changed"
 	DDLWorkerHistogram      = prometheus.NewHistogramVec(
@@ -88,12 +89,12 @@ var (
 			Name:      "worker_operation_duration_seconds",
 			Help:      "Bucketed histogram of processing time (s) of ddl worker operations",
 			Buckets:   prometheus.ExponentialBuckets(0.001, 2, 20),
-		}, []string{LblType, LblResult})
+		}, []string{LblType, LblAction, LblResult})
 
-	CreateDDL       = "create_ddl"
-	CreateDDLWorker = "create_ddl_worker"
-	IsDDLOwner      = "is_ddl_owner"
-	DDLCounter      = prometheus.NewCounterVec(
+	CreateDDLInstance = "create_ddl_instance"
+	CreateDDL         = "create_ddl"
+	DDLOwner          = "owner"
+	DDLCounter        = prometheus.NewCounterVec(
 		prometheus.CounterOpts{
 			Namespace: "tidb",
 			Subsystem: "ddl",
@@ -102,13 +103,7 @@ var (
 		}, []string{LblType})
 )
 
-func init() {
-	prometheus.MustRegister(JobsGauge)
-	prometheus.MustRegister(HandleJobHistogram)
-	prometheus.MustRegister(BatchAddIdxHistogram)
-	prometheus.MustRegister(DeploySyncerHistogram)
-	prometheus.MustRegister(UpdateSelfVersionHistogram)
-	prometheus.MustRegister(OwnerHandleSyncerHistogram)
-	prometheus.MustRegister(DDLWorkerHistogram)
-	prometheus.MustRegister(DDLCounter)
-}
+// Label constants.
+const (
+	LblAction = "action"
+)

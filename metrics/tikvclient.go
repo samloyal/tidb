@@ -85,14 +85,6 @@ var (
 			Buckets:   prometheus.ExponentialBuckets(0.0005, 2, 20),
 		}, []string{LblType, "store"})
 
-	TiKVCoprocessorCounter = prometheus.NewCounterVec(
-		prometheus.CounterOpts{
-			Namespace: "tidb",
-			Subsystem: "tikvclient",
-			Name:      "cop_actions_total",
-			Help:      "Counter of coprocessor actions.",
-		}, []string{LblType})
-
 	TiKVCoprocessorHistogram = prometheus.NewHistogram(
 		prometheus.HistogramOpts{
 			Namespace: "tidb",
@@ -187,25 +179,3 @@ var (
 			Help:      "Counter of region cache.",
 		}, []string{LblType, LblResult})
 )
-
-func init() {
-	prometheus.MustRegister(TiKVTxnCounter)
-	prometheus.MustRegister(TiKVSnapshotCounter)
-	prometheus.MustRegister(TiKVTxnCmdHistogram)
-	prometheus.MustRegister(TiKVBackoffCounter)
-	prometheus.MustRegister(TiKVBackoffHistogram)
-	prometheus.MustRegister(TiKVSendReqHistogram)
-	prometheus.MustRegister(TiKVConnPoolHistogram)
-	prometheus.MustRegister(TiKVCoprocessorCounter)
-	prometheus.MustRegister(TiKVCoprocessorHistogram)
-	prometheus.MustRegister(TiKVLockResolverCounter)
-	prometheus.MustRegister(TiKVRegionErrorCounter)
-	prometheus.MustRegister(TiKVTxnWriteKVCountHistogram)
-	prometheus.MustRegister(TiKVTxnWriteSizeHistogram)
-	prometheus.MustRegister(TiKVRawkvCmdHistogram)
-	prometheus.MustRegister(TiKVRawkvSizeHistogram)
-	prometheus.MustRegister(TiKVTxnRegionsNumHistogram)
-	prometheus.MustRegister(TiKVLoadSafepointCounter)
-	prometheus.MustRegister(TiKVSecondaryLockCleanupFailureCounter)
-	prometheus.MustRegister(TiKVRegionCacheCounter)
-}

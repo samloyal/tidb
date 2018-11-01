@@ -15,15 +15,14 @@ package executor_test
 
 import (
 	. "github.com/pingcap/check"
+	"github.com/pingcap/parser/auth"
+	"github.com/pingcap/parser/model"
+	"github.com/pingcap/parser/mysql"
+	"github.com/pingcap/parser/terror"
 	"github.com/pingcap/tidb/domain"
 	"github.com/pingcap/tidb/executor"
-	"github.com/pingcap/tidb/model"
-	"github.com/pingcap/tidb/mysql"
-	"github.com/pingcap/tidb/privilege/privileges"
 	"github.com/pingcap/tidb/session"
 	"github.com/pingcap/tidb/sessionctx"
-	"github.com/pingcap/tidb/terror"
-	"github.com/pingcap/tidb/util/auth"
 	"github.com/pingcap/tidb/util/testkit"
 	"golang.org/x/net/context"
 )
@@ -173,11 +172,31 @@ func (s *testSuite) TestUser(c *C) {
 	// Test 'identified by password'
 	createUserSQL = `CREATE USER 'test1'@'localhost' identified by password 'xxx';`
 	_, err = tk.Exec(createUserSQL)
-	c.Assert(terror.ErrorEqual(executor.ErrPasswordFormat, err), IsTrue)
+	c.Assert(terror.ErrorEqual(executor.ErrPasswordFormat, err), IsTrue, Commentf("err %v", err))
 	createUserSQL = `CREATE USER 'test1'@'localhost' identified by password '*3D56A309CD04FA2EEF181462E59011F075C89548';`
 	tk.MustExec(createUserSQL)
 	dropUserSQL = `DROP USER 'test1'@'localhost';`
 	tk.MustExec(dropUserSQL)
+	tk.MustQuery("select * from mysql.db").Check(testkit.Rows(
+		"localhost test testDB Y Y Y Y Y Y Y N Y Y N N N N N N Y N N",
+		"localhost test testDB1 Y Y Y Y Y Y Y N Y Y N N N N N N Y N N",
+		"% dddb_% dduser Y Y Y Y Y Y Y N Y Y N N N N N N Y N N",
+		"% test test Y N N N N N N N N N N N N N N N N N N",
+		"localhost test testDBRevoke N N N N N N N N N N N N N N N N N N N",
+	))
+
+	// Test drop user meet error
+	_, err = tk.Exec(dropUserSQL)
+	c.Assert(terror.ErrorEqual(err, executor.ErrCannotUser.GenWithStackByArgs("DROP USER", "")), IsTrue, Commentf("err %v", err))
+
+	createUserSQL = `CREATE USER 'test1'@'localhost'`
+	tk.MustExec(createUserSQL)
+	createUserSQL = `CREATE USER 'test2'@'localhost'`
+	tk.MustExec(createUserSQL)
+
+	dropUserSQL = `DROP USER 'test1'@'localhost', 'test2'@'localhost', 'test3'@'localhost';`
+	_, err = tk.Exec(dropUserSQL)
+	c.Assert(terror.ErrorEqual(err, executor.ErrCannotUser.GenWithStackByArgs("DROP USER", "")), IsTrue, Commentf("err %v", err))
 }
 
 func (s *testSuite) TestSetPwd(c *C) {
@@ -204,7 +223,7 @@ func (s *testSuite) TestSetPwd(c *C) {
 	ctx.GetSessionVars().User = &auth.UserIdentity{Username: "testpwd1", Hostname: "localhost"}
 	// Session user doesn't exist.
 	_, err = tk.Exec(setPwdSQL)
-	c.Check(terror.ErrorEqual(err, executor.ErrPasswordNoMatch), IsTrue)
+	c.Check(terror.ErrorEqual(err, executor.ErrPasswordNoMatch), IsTrue, Commentf("err %v", err))
 	// normal
 	ctx.GetSessionVars().User = &auth.UserIdentity{Username: "testpwd", Hostname: "localhost"}
 	tk.MustExec(setPwdSQL)
@@ -222,9 +241,6 @@ func (s *testSuite) TestKillStmt(c *C) {
 }
 
 func (s *testSuite) TestFlushPrivileges(c *C) {
-	// Global variables is really bad, when the test cases run concurrently.
-	save := privileges.Enable
-	privileges.Enable = true
 	tk := testkit.NewTestKit(c, s.store)
 
 	tk.MustExec(`CREATE USER 'testflush'@'localhost' IDENTIFIED BY '';`)
@@ -247,8 +263,6 @@ func (s *testSuite) TestFlushPrivileges(c *C) {
 	// After flush.
 	_, err = se.Execute(ctx, `SELECT Password FROM mysql.User WHERE User="testflush" and Host="localhost"`)
 	c.Check(err, IsNil)
-
-	privileges.Enable = save
 }
 
 func (s *testSuite) TestDropStats(c *C) {
@@ -277,9 +291,19 @@ func (s *testSuite) TestDropStats(c *C) {
 
 	h.Lease = 1
 	testKit.MustExec("drop stats t")
-	h.HandleDDLEvent(<-h.DDLEventCh())
 	h.Update(is)
 	statsTbl = h.GetTableStats(tableInfo)
 	c.Assert(statsTbl.Pseudo, IsTrue)
 	h.Lease = 0
+}
+
+func (s *testSuite) TestFlushTables(c *C) {
+	tk := testkit.NewTestKit(c, s.store)
+
+	_, err := tk.Exec("FLUSH TABLES")
+	c.Check(err, IsNil)
+
+	_, err = tk.Exec("FLUSH TABLES WITH READ LOCK")
+	c.Check(err, NotNil)
+
 }

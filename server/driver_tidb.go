@@ -16,16 +16,20 @@ package server
 import (
 	"crypto/tls"
 	"fmt"
+	"time"
 
-	"github.com/juju/errors"
-	"github.com/pingcap/tidb/ast"
+	"github.com/pingcap/parser/ast"
+	"github.com/pingcap/parser/auth"
+	"github.com/pingcap/parser/mysql"
+	"github.com/pingcap/parser/terror"
 	"github.com/pingcap/tidb/kv"
-	"github.com/pingcap/tidb/mysql"
 	"github.com/pingcap/tidb/session"
+	"github.com/pingcap/tidb/sessionctx/variable"
 	"github.com/pingcap/tidb/types"
 	"github.com/pingcap/tidb/util"
-	"github.com/pingcap/tidb/util/auth"
 	"github.com/pingcap/tidb/util/chunk"
+	"github.com/pingcap/tidb/util/sqlexec"
+	"github.com/pkg/errors"
 	"golang.org/x/net/context"
 )
 
@@ -56,6 +60,8 @@ type TiDBStatement struct {
 	boundParams [][]byte
 	paramsType  []byte
 	ctx         *TiDBContext
+	rs          ResultSet
+	sql         string
 }
 
 // ID implements PreparedStatement ID method.
@@ -83,7 +89,12 @@ func (ts *TiDBStatement) AppendParam(paramID int, data []byte) error {
 	if paramID >= len(ts.boundParams) {
 		return mysql.NewErr(mysql.ErrWrongArguments, "stmt_send_longdata")
 	}
-	ts.boundParams[paramID] = append(ts.boundParams[paramID], data...)
+	// If len(data) is 0, append an empty byte slice to the end to distinguish no data and no parameter.
+	if len(data) == 0 {
+		ts.boundParams[paramID] = []byte{}
+	} else {
+		ts.boundParams[paramID] = append(ts.boundParams[paramID], data...)
+	}
 	return nil
 }
 
@@ -107,10 +118,33 @@ func (ts *TiDBStatement) GetParamsType() []byte {
 	return ts.paramsType
 }
 
+// StoreResultSet stores ResultSet for stmt fetching
+func (ts *TiDBStatement) StoreResultSet(rs ResultSet) {
+	// refer to https://dev.mysql.com/doc/refman/5.7/en/cursor-restrictions.html
+	// You can have open only a single cursor per prepared statement.
+	// closing previous ResultSet before associating a new ResultSet with this statement
+	// if it exists
+	if ts.rs != nil {
+		terror.Call(ts.rs.Close)
+	}
+	ts.rs = rs
+}
+
+// GetResultSet gets ResultSet associated this statement
+func (ts *TiDBStatement) GetResultSet() ResultSet {
+	return ts.rs
+}
+
 // Reset implements PreparedStatement Reset method.
 func (ts *TiDBStatement) Reset() {
 	for i := range ts.boundParams {
 		ts.boundParams[i] = nil
+	}
+
+	// closing previous ResultSet if it exists
+	if ts.rs != nil {
+		terror.Call(ts.rs.Close)
+		ts.rs = nil
 	}
 }
 
@@ -122,6 +156,11 @@ func (ts *TiDBStatement) Close() error {
 		return errors.Trace(err)
 	}
 	delete(ts.ctx.stmts, int(ts.id))
+
+	// close ResultSet associated with this statement
+	if ts.rs != nil {
+		terror.Call(ts.rs.Close)
+	}
 	return nil
 }
 
@@ -169,6 +208,11 @@ func (tc *TiDBContext) SetValue(key fmt.Stringer, value interface{}) {
 // CommitTxn implements QueryCtx CommitTxn method.
 func (tc *TiDBContext) CommitTxn(ctx context.Context) error {
 	return tc.session.CommitTxn(ctx)
+}
+
+// SetProcessInfo implements QueryCtx SetProcessInfo method.
+func (tc *TiDBContext) SetProcessInfo(sql string, t time.Time, command byte) {
+	tc.session.SetProcessInfo(sql, t, command)
 }
 
 // RollbackTxn implements QueryCtx RollbackTxn method.
@@ -221,6 +265,11 @@ func (tc *TiDBContext) SetClientCapability(flags uint32) {
 
 // Close implements QueryCtx Close method.
 func (tc *TiDBContext) Close() error {
+	// close PreparedStatement associated with this connection
+	for _, v := range tc.stmts {
+		terror.Call(v.Close)
+	}
+
 	tc.session.Close()
 	return nil
 }
@@ -259,6 +308,7 @@ func (tc *TiDBContext) Prepare(sql string) (statement PreparedStatement, columns
 		return
 	}
 	stmt := &TiDBStatement{
+		sql:         sql,
 		id:          stmtID,
 		numParams:   paramCount,
 		boundParams: make([][]byte, paramCount),
@@ -284,9 +334,21 @@ func (tc *TiDBContext) ShowProcess() util.ProcessInfo {
 	return tc.session.ShowProcess()
 }
 
+// SetCommandValue implements QueryCtx SetCommandValue method.
+func (tc *TiDBContext) SetCommandValue(command byte) {
+	tc.session.SetCommandValue(command)
+}
+
+// GetSessionVars return SessionVars.
+func (tc *TiDBContext) GetSessionVars() *variable.SessionVars {
+	return tc.session.GetSessionVars()
+}
+
 type tidbResultSet struct {
-	recordSet ast.RecordSet
+	recordSet sqlexec.RecordSet
 	columns   []*ColumnInfo
+	rows      []chunk.Row
+	closed    bool
 }
 
 func (trs *tidbResultSet) NewChunk() *chunk.Chunk {
@@ -297,7 +359,22 @@ func (trs *tidbResultSet) Next(ctx context.Context, chk *chunk.Chunk) error {
 	return trs.recordSet.Next(ctx, chk)
 }
 
+func (trs *tidbResultSet) StoreFetchedRows(rows []chunk.Row) {
+	trs.rows = rows
+}
+
+func (trs *tidbResultSet) GetFetchedRows() []chunk.Row {
+	if trs.rows == nil {
+		trs.rows = make([]chunk.Row, 0, 1024)
+	}
+	return trs.rows
+}
+
 func (trs *tidbResultSet) Close() error {
+	if trs.closed {
+		return nil
+	}
+	trs.closed = true
 	return trs.recordSet.Close()
 }
 
@@ -334,7 +411,7 @@ func convertColumnInfo(fld *ast.ResultField) (ci *ColumnInfo) {
 			// Consider the decimal point.
 			ci.ColumnLength++
 		}
-	} else if fld.Column.Tp != mysql.TypeBit && fld.Column.Tp != mysql.TypeTiny {
+	} else if types.IsString(fld.Column.Tp) {
 		// Fix issue #4540.
 		// The flen is a hint, not a precise value, so most client will not use the value.
 		// But we found in rare MySQL client, like Navicat for MySQL(version before 12) will truncate
@@ -346,11 +423,17 @@ func convertColumnInfo(fld *ast.ResultField) (ci *ColumnInfo) {
 		// * Utf-8, the multiple is 3
 		// * utf8mb4, the multiple is 4
 		// So the large enough multiple is 4 in here.
+		// We used to check non-string types to avoid the truncation problem in some MySQL
+		// client such as Navicat. Now we only allow string type enter this branch.
 		ci.ColumnLength = ci.ColumnLength * mysql.MaxBytesOfCharacter
 	}
 
 	if fld.Column.Decimal == types.UnspecifiedLength {
-		ci.Decimal = mysql.NotFixedDec
+		if fld.Column.Tp == mysql.TypeDuration {
+			ci.Decimal = types.DefaultFsp
+		} else {
+			ci.Decimal = mysql.NotFixedDec
+		}
 	} else {
 		ci.Decimal = uint8(fld.Column.Decimal)
 	}

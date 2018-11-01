@@ -23,24 +23,28 @@ import (
 
 	"github.com/coreos/etcd/clientv3"
 	"github.com/grpc-ecosystem/go-grpc-prometheus"
-	"github.com/juju/errors"
 	"github.com/ngaut/pools"
+	"github.com/ngaut/sync2"
+	"github.com/pingcap/parser/ast"
+	"github.com/pingcap/parser/model"
+	"github.com/pingcap/parser/terror"
+	"github.com/pingcap/tidb/config"
 	"github.com/pingcap/tidb/ddl"
 	"github.com/pingcap/tidb/infoschema"
 	"github.com/pingcap/tidb/kv"
 	"github.com/pingcap/tidb/meta"
 	"github.com/pingcap/tidb/metrics"
-	"github.com/pingcap/tidb/model"
 	"github.com/pingcap/tidb/owner"
 	"github.com/pingcap/tidb/privilege/privileges"
 	"github.com/pingcap/tidb/sessionctx"
 	"github.com/pingcap/tidb/sessionctx/variable"
 	"github.com/pingcap/tidb/statistics"
-	"github.com/pingcap/tidb/terror"
 	"github.com/pingcap/tidb/util"
+	"github.com/pkg/errors"
 	log "github.com/sirupsen/logrus"
 	"golang.org/x/net/context"
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/keepalive"
 )
 
 // Domain represents a storage space. Different domains can use the same database name.
@@ -51,13 +55,17 @@ type Domain struct {
 	privHandle      *privileges.Handle
 	statsHandle     unsafe.Pointer
 	statsLease      time.Duration
+	statsUpdating   sync2.AtomicInt32
 	ddl             ddl.DDL
+	info            *InfoSyncer
 	m               sync.Mutex
 	SchemaValidator SchemaValidator
 	sysSessionPool  *pools.ResourcePool
 	exit            chan struct{}
 	etcdClient      *clientv3.Client
 	wg              sync.WaitGroup
+	gvc             GlobalVariableCache
+	slowQuery       *topNSlowQueries
 
 	MockReloadFailed MockFailure // It mocks reload failed.
 }
@@ -99,8 +107,8 @@ func (do *Domain) loadInfoSchema(handle *infoschema.Handle, usedSchemaVersion in
 		log.Errorf("[ddl] failed to load schema diff err %v", err)
 	}
 	if ok {
-		log.Infof("[ddl] diff load InfoSchema from version %d to %d, in %v",
-			usedSchemaVersion, latestSchemaVersion, time.Since(startTime))
+		log.Infof("[ddl] diff load InfoSchema from version %d to %d in %v, tableIDs %v",
+			usedSchemaVersion, latestSchemaVersion, time.Since(startTime), tblIDs)
 		return latestSchemaVersion, tblIDs, fullLoad, nil
 	}
 
@@ -250,6 +258,11 @@ func (do *Domain) DDL() ddl.DDL {
 	return do.ddl
 }
 
+// InfoSyncer gets infoSyncer from domain.
+func (do *Domain) InfoSyncer() *InfoSyncer {
+	return do.info
+}
+
 // Store gets KV store from domain.
 func (do *Domain) Store() kv.Storage {
 	return do.store
@@ -322,6 +335,57 @@ func (do *Domain) Reload() error {
 	return nil
 }
 
+// LogSlowQuery keeps topN recent slow queries in domain.
+func (do *Domain) LogSlowQuery(query *SlowQueryInfo) {
+	do.slowQuery.mu.RLock()
+	defer do.slowQuery.mu.RUnlock()
+	if do.slowQuery.mu.closed {
+		return
+	}
+
+	select {
+	case do.slowQuery.ch <- query:
+	default:
+	}
+}
+
+// ShowSlowQuery returns the slow queries.
+func (do *Domain) ShowSlowQuery(showSlow *ast.ShowSlow) []*SlowQueryInfo {
+	msg := &showSlowMessage{
+		request: showSlow,
+	}
+	msg.Add(1)
+	do.slowQuery.msgCh <- msg
+	msg.Wait()
+	return msg.result
+}
+
+func (do *Domain) topNSlowQueryLoop() {
+	defer recoverInDomain("topNSlowQueryLoop", false)
+	defer do.wg.Done()
+	ticker := time.NewTicker(time.Minute * 10)
+	defer ticker.Stop()
+	for {
+		select {
+		case now := <-ticker.C:
+			do.slowQuery.RemoveExpired(now)
+		case info, ok := <-do.slowQuery.ch:
+			if !ok {
+				return
+			}
+			do.slowQuery.Append(info)
+		case msg := <-do.slowQuery.msgCh:
+			req := msg.request
+			if req.Tp == ast.ShowSlowTop {
+				msg.result = do.slowQuery.QueryTop(int(req.Count), req.Kind)
+			} else if req.Tp == ast.ShowSlowRecent {
+				msg.result = do.slowQuery.QueryRecent(int(req.Count))
+			}
+			msg.Done()
+		}
+	}
+}
+
 func (do *Domain) loadSchemaInLoop(lease time.Duration) {
 	defer do.wg.Done()
 	// Lease renewal can run at any frequency.
@@ -338,21 +402,29 @@ func (do *Domain) loadSchemaInLoop(lease time.Duration) {
 			if err != nil {
 				log.Errorf("[ddl] reload schema in loop err %v", errors.ErrorStack(err))
 			}
-		case <-syncer.GlobalVersionCh():
+		case _, ok := <-syncer.GlobalVersionCh():
 			err := do.Reload()
 			if err != nil {
 				log.Errorf("[ddl] reload schema in loop err %v", errors.ErrorStack(err))
 			}
+			if !ok {
+				log.Warn("[ddl] reload schema in loop, schema syncer need rewatch")
+				// Make sure the rewatch doesn't affect load schema, so we watch the global schema version asynchronously.
+				syncer.WatchGlobalSchemaVer(context.Background())
+			}
 		case <-syncer.Done():
 			// The schema syncer stops, we need stop the schema validator to synchronize the schema version.
 			log.Info("[ddl] reload schema in loop, schema syncer need restart")
-			do.SchemaValidator.Stop()
 			err := do.mustRestartSyncer()
 			if err != nil {
 				log.Errorf("[ddl] reload schema in loop, schema syncer restart err %v", errors.ErrorStack(err))
 				break
 			}
-			do.SchemaValidator.Restart()
+			log.Info("[ddl] schema syncer restarted.")
+		case <-do.info.Done():
+			log.Info("[ddl] reload schema in loop, server info syncer need restart")
+			do.info.Restart(context.Background())
+			log.Info("[ddl] server info syncer restarted.")
 		case <-do.exit:
 			return
 		}
@@ -386,12 +458,17 @@ func (do *Domain) Close() {
 	if do.ddl != nil {
 		terror.Log(errors.Trace(do.ddl.Stop()))
 	}
+	if do.info != nil {
+		do.info.RemoveServerInfo()
+	}
 	close(do.exit)
 	if do.etcdClient != nil {
 		terror.Log(errors.Trace(do.etcdClient.Close()))
 	}
 	do.sysSessionPool.Close()
+	do.slowQuery.Close()
 	do.wg.Wait()
+	log.Info("[domain] close")
 }
 
 type ddlCallback struct {
@@ -452,19 +529,32 @@ func NewDomain(store kv.Storage, ddlLease time.Duration, statsLease time.Duratio
 		sysSessionPool:  pools.NewResourcePool(factory, capacity, capacity, resourceIdleTimeout),
 		statsLease:      statsLease,
 		infoHandle:      infoschema.NewHandle(store),
+		slowQuery:       newTopNSlowQueries(30, time.Hour*24*7, 500),
 	}
+}
+
+// ResetHandle resets the domain's infoschema handle. It is used for testing.
+func (do *Domain) ResetHandle(store kv.Storage) {
+	do.infoHandle = infoschema.NewHandle(store)
 }
 
 // Init initializes a domain.
 func (do *Domain) Init(ddlLease time.Duration, sysFactory func(*Domain) (pools.Resource, error)) error {
 	if ebd, ok := do.store.(EtcdBackend); ok {
 		if addrs := ebd.EtcdAddrs(); addrs != nil {
+			cfg := config.GetGlobalConfig()
 			cli, err := clientv3.New(clientv3.Config{
 				Endpoints:   addrs,
 				DialTimeout: 5 * time.Second,
 				DialOptions: []grpc.DialOption{
 					grpc.WithUnaryInterceptor(grpc_prometheus.UnaryClientInterceptor),
 					grpc.WithStreamInterceptor(grpc_prometheus.StreamClientInterceptor),
+					grpc.WithBackoffMaxDelay(time.Second * 3),
+					grpc.WithKeepaliveParams(keepalive.ClientParameters{
+						Time:                time.Duration(cfg.TiKVClient.GrpcKeepAliveTime) * time.Second,
+						Timeout:             time.Duration(cfg.TiKVClient.GrpcKeepAliveTimeout) * time.Second,
+						PermitWithoutStream: true,
+					}),
 				},
 				TLS: ebd.TLSConfig(),
 			})
@@ -493,6 +583,11 @@ func (do *Domain) Init(ddlLease time.Duration, sysFactory func(*Domain) (pools.R
 	if err != nil {
 		return errors.Trace(err)
 	}
+	do.info = NewInfoSyncer(do.ddl.GetID(), do.etcdClient)
+	err = do.info.Init(ctx)
+	if err != nil {
+		return errors.Trace(err)
+	}
 	err = do.Reload()
 	if err != nil {
 		return errors.Trace(err)
@@ -505,6 +600,8 @@ func (do *Domain) Init(ddlLease time.Duration, sysFactory func(*Domain) (pools.R
 		// Local store needs to get the change information for every DDL state in each session.
 		go do.loadSchemaInLoop(ddlLease)
 	}
+	do.wg.Add(1)
+	go do.topNSlowQueryLoop()
 
 	return nil
 }
@@ -580,6 +677,20 @@ func (do *Domain) CreateStatsHandle(ctx sessionctx.Context) {
 	atomic.StorePointer(&do.statsHandle, unsafe.Pointer(statistics.NewHandle(ctx, do.statsLease)))
 }
 
+// StatsUpdating checks if the stats worker is updating.
+func (do *Domain) StatsUpdating() bool {
+	return do.statsUpdating.Get() > 0
+}
+
+// SetStatsUpdating sets the value of stats updating.
+func (do *Domain) SetStatsUpdating(val bool) {
+	if val {
+		do.statsUpdating.Set(1)
+	} else {
+		do.statsUpdating.Set(0)
+	}
+}
+
 // RunAutoAnalyze indicates if this TiDB server starts auto analyze worker and can run auto analyze job.
 var RunAutoAnalyze = true
 
@@ -596,6 +707,7 @@ func (do *Domain) UpdateTableStatsLoop(ctx sessionctx.Context) error {
 	}
 	owner := do.newStatsOwner()
 	do.wg.Add(1)
+	do.SetStatsUpdating(true)
 	go do.updateStatsWorker(ctx, owner)
 	if RunAutoAnalyze {
 		do.wg.Add(1)
@@ -616,14 +728,14 @@ func (do *Domain) newStatsOwner() owner.Manager {
 	// TODO: Need to do something when err is not nil.
 	err := statsOwner.CampaignOwner(cancelCtx)
 	if err != nil {
-		log.Warnf("[stats] campaign owner fail:", errors.ErrorStack(err))
+		log.Warnf("[stats] campaign owner fail: %s", errors.ErrorStack(err))
 	}
 	return statsOwner
 }
 
 func (do *Domain) updateStatsWorker(ctx sessionctx.Context, owner owner.Manager) {
 	lease := do.statsLease
-	deltaUpdateDuration := lease * 5
+	deltaUpdateDuration := lease * 20
 	loadTicker := time.NewTicker(lease)
 	defer loadTicker.Stop()
 	deltaUpdateTicker := time.NewTicker(deltaUpdateDuration)
@@ -640,56 +752,55 @@ func (do *Domain) updateStatsWorker(ctx sessionctx.Context, owner owner.Manager)
 	t := time.Now()
 	err := statsHandle.InitStats(do.InfoSchema())
 	if err != nil {
-		log.Error("[stats] init stats info failed: ", errors.ErrorStack(err))
+		log.Debug("[stats] init stats info failed: ", errors.ErrorStack(err))
 	} else {
 		log.Info("[stats] init stats info takes ", time.Now().Sub(t))
 	}
-	defer recoverInDomain("updateStatsWorker", false)
+	defer func() {
+		do.SetStatsUpdating(false)
+		recoverInDomain("updateStatsWorker", false)
+		do.wg.Done()
+	}()
 	for {
 		select {
 		case <-loadTicker.C:
 			err = statsHandle.Update(do.InfoSchema())
 			if err != nil {
-				log.Error("[stats] update stats info fail: ", errors.ErrorStack(err))
+				log.Debug("[stats] update stats info fail: ", errors.ErrorStack(err))
 			}
 		case <-do.exit:
-			do.wg.Done()
+			statsHandle.FlushStats()
 			return
-			// This channel is sent only by ddl owner or the drop stats executor.
+			// This channel is sent only by ddl owner.
 		case t := <-statsHandle.DDLEventCh():
 			err = statsHandle.HandleDDLEvent(t)
 			if err != nil {
-				log.Error("[stats] handle ddl event fail: ", errors.ErrorStack(err))
-			}
-		case t := <-statsHandle.AnalyzeResultCh():
-			for i, hg := range t.Hist {
-				err = statistics.SaveStatsToStorage(ctx, t.TableID, t.Count, t.IsIndex, hg, t.Cms[i])
-				if err != nil {
-					log.Error("[stats] save histogram to storage fail: ", errors.ErrorStack(err))
-				}
+				log.Debug("[stats] handle ddl event fail: ", errors.ErrorStack(err))
 			}
 		case <-deltaUpdateTicker.C:
-			err = statsHandle.DumpStatsDeltaToKV()
+			err = statsHandle.DumpStatsDeltaToKV(statistics.DumpDelta)
 			if err != nil {
-				log.Error("[stats] dump stats delta fail: ", errors.ErrorStack(err))
+				log.Debug("[stats] dump stats delta fail: ", errors.ErrorStack(err))
 			}
+			statsHandle.UpdateErrorRate(do.InfoSchema())
 		case <-loadHistogramTicker.C:
 			err = statsHandle.LoadNeededHistograms()
 			if err != nil {
-				log.Error("[stats] load histograms fail: ", errors.ErrorStack(err))
+				log.Debug("[stats] load histograms fail: ", errors.ErrorStack(err))
 			}
 		case <-loadFeedbackTicker.C:
+			statsHandle.UpdateStatsByLocalFeedback(do.InfoSchema())
 			if !owner.IsOwner() {
 				continue
 			}
 			err = statsHandle.HandleUpdateStats(do.InfoSchema())
 			if err != nil {
-				log.Errorf("[stats] update stats using feedback fail: ", errors.ErrorStack(err))
+				log.Debug("[stats] update stats using feedback fail: ", errors.ErrorStack(err))
 			}
 		case <-dumpFeedbackTicker.C:
 			err = statsHandle.DumpStatsFeedbackToKV()
 			if err != nil {
-				log.Error("[stats] dump stats feedback fail: ", errors.ErrorStack(err))
+				log.Debug("[stats] dump stats feedback fail: ", errors.ErrorStack(err))
 			}
 		case <-gcStatsTicker.C:
 			if !owner.IsOwner() {
@@ -697,7 +808,7 @@ func (do *Domain) updateStatsWorker(ctx sessionctx.Context, owner owner.Manager)
 			}
 			err = statsHandle.GCStats(do.InfoSchema(), do.DDL().GetLease())
 			if err != nil {
-				log.Error("[stats] gc stats fail: ", errors.ErrorStack(err))
+				log.Debug("[stats] gc stats fail: ", errors.ErrorStack(err))
 			}
 		}
 	}
@@ -707,7 +818,10 @@ func (do *Domain) autoAnalyzeWorker(owner owner.Manager) {
 	statsHandle := do.StatsHandle()
 	analyzeTicker := time.NewTicker(do.statsLease)
 	defer analyzeTicker.Stop()
-	defer recoverInDomain("autoAnalyzeWorker", false)
+	defer func() {
+		recoverInDomain("autoAnalyzeWorker", false)
+		do.wg.Done()
+	}()
 	for {
 		select {
 		case <-analyzeTicker.C:
@@ -718,7 +832,6 @@ func (do *Domain) autoAnalyzeWorker(owner owner.Manager) {
 				}
 			}
 		case <-do.exit:
-			do.wg.Done()
 			return
 		}
 	}

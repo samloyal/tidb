@@ -17,19 +17,23 @@ package mock
 import (
 	"fmt"
 	"sync"
+	"time"
 
-	"github.com/juju/errors"
 	"github.com/pingcap/tidb/kv"
+	"github.com/pingcap/tidb/owner"
 	"github.com/pingcap/tidb/sessionctx"
 	"github.com/pingcap/tidb/sessionctx/variable"
 	"github.com/pingcap/tidb/types"
 	"github.com/pingcap/tidb/util"
 	"github.com/pingcap/tidb/util/kvcache"
+	"github.com/pingcap/tidb/util/sqlexec"
 	binlog "github.com/pingcap/tipb/go-binlog"
+	"github.com/pkg/errors"
 	"golang.org/x/net/context"
 )
 
 var _ sessionctx.Context = (*Context)(nil)
+var _ sqlexec.SQLExecutor = (*Context)(nil)
 
 // Context represents mocked sessionctx.Context.
 type Context struct {
@@ -42,6 +46,16 @@ type Context struct {
 	cancel      context.CancelFunc
 	sm          util.SessionManager
 	pcache      *kvcache.SimpleLRUCache
+}
+
+// Execute implements sqlexec.SQLExecutor Execute interface.
+func (c *Context) Execute(ctx context.Context, sql string) ([]sqlexec.RecordSet, error) {
+	return nil, errors.Errorf("Not Support.")
+}
+
+// DDLOwnerChecker returns owner.DDLOwnerChecker.
+func (c *Context) DDLOwnerChecker() owner.DDLOwnerChecker {
+	return nil
 }
 
 // SetValue implements sessionctx.Context SetValue interface.
@@ -82,7 +96,7 @@ func (c *Context) GetClient() kv.Client {
 func (c *Context) GetGlobalSysVar(ctx sessionctx.Context, name string) (string, error) {
 	v := variable.GetSysVar(name)
 	if v == nil {
-		return "", variable.UnknownSystemVar.GenByArgs(name)
+		return "", variable.UnknownSystemVar.GenWithStackByArgs(name)
 	}
 	return v.Value, nil
 }
@@ -91,7 +105,7 @@ func (c *Context) GetGlobalSysVar(ctx sessionctx.Context, name string) (string, 
 func (c *Context) SetGlobalSysVar(ctx sessionctx.Context, name string, value string) error {
 	v := variable.GetSysVar(name)
 	if v == nil {
-		return variable.UnknownSystemVar.GenByArgs(name)
+		return variable.UnknownSystemVar.GenWithStackByArgs(name)
 	}
 	v.Value = value
 	return nil
@@ -149,7 +163,7 @@ func (c *Context) InitTxnWithStartTS(startTS uint64) error {
 	}
 	if c.Store != nil {
 		membufCap := kv.DefaultTxnMembufCap
-		if c.sessionVars.ImportingData {
+		if c.sessionVars.LightningMode {
 			membufCap = kv.ImportingTxnMembufCap
 		}
 		txn, err := c.Store.BeginWithStartTS(startTS)
@@ -217,6 +231,8 @@ func NewContext() *Context {
 		cancel:      cancel,
 	}
 	sctx.sessionVars.MaxChunkSize = 2
+	sctx.sessionVars.StmtCtx.TimeZone = time.UTC
+	sctx.sessionVars.GlobalVarsAccessor = variable.NewMockGlobalAccessor()
 	return sctx
 }
 

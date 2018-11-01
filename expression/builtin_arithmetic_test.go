@@ -17,9 +17,10 @@ import (
 	"time"
 
 	. "github.com/pingcap/check"
-	"github.com/pingcap/tidb/ast"
-	"github.com/pingcap/tidb/mysql"
+	"github.com/pingcap/parser/ast"
+	"github.com/pingcap/parser/mysql"
 	"github.com/pingcap/tidb/types"
+	"github.com/pingcap/tidb/util/chunk"
 	"github.com/pingcap/tidb/util/testleak"
 	"github.com/pingcap/tidb/util/testutil"
 )
@@ -99,7 +100,7 @@ func (s *testEvaluatorSuite) TestArithmeticPlus(c *C) {
 	c.Assert(ok, IsTrue)
 	c.Assert(intSig, NotNil)
 
-	intResult, isNull, err := intSig.evalInt(nil)
+	intResult, isNull, err := intSig.evalInt(chunk.Row{})
 	c.Assert(err, IsNil)
 	c.Assert(isNull, IsFalse)
 	c.Assert(intResult, Equals, int64(13))
@@ -114,7 +115,7 @@ func (s *testEvaluatorSuite) TestArithmeticPlus(c *C) {
 	c.Assert(ok, IsTrue)
 	c.Assert(realSig, NotNil)
 
-	realResult, isNull, err := realSig.evalReal(nil)
+	realResult, isNull, err := realSig.evalReal(chunk.Row{})
 	c.Assert(err, IsNil)
 	c.Assert(isNull, IsFalse)
 	c.Assert(realResult, Equals, float64(1.00001))
@@ -129,7 +130,7 @@ func (s *testEvaluatorSuite) TestArithmeticPlus(c *C) {
 	c.Assert(ok, IsTrue)
 	c.Assert(realSig, NotNil)
 
-	realResult, isNull, err = realSig.evalReal(nil)
+	realResult, isNull, err = realSig.evalReal(chunk.Row{})
 	c.Assert(err, IsNil)
 	c.Assert(isNull, IsTrue)
 	c.Assert(realResult, Equals, float64(0))
@@ -144,7 +145,7 @@ func (s *testEvaluatorSuite) TestArithmeticPlus(c *C) {
 	c.Assert(ok, IsTrue)
 	c.Assert(realSig, NotNil)
 
-	realResult, isNull, err = realSig.evalReal(nil)
+	realResult, isNull, err = realSig.evalReal(chunk.Row{})
 	c.Assert(err, IsNil)
 	c.Assert(isNull, IsTrue)
 	c.Assert(realResult, Equals, float64(0))
@@ -161,7 +162,7 @@ func (s *testEvaluatorSuite) TestArithmeticPlus(c *C) {
 	c.Assert(ok, IsTrue)
 	c.Assert(intSig, NotNil)
 
-	intResult, _, err = intSig.evalInt(nil)
+	intResult, _, err = intSig.evalInt(chunk.Row{})
 	c.Assert(err, IsNil)
 	c.Assert(intResult, Equals, int64(9007199254740993))
 }
@@ -179,7 +180,7 @@ func (s *testEvaluatorSuite) TestArithmeticMinus(c *C) {
 	c.Assert(ok, IsTrue)
 	c.Assert(intSig, NotNil)
 
-	intResult, isNull, err := intSig.evalInt(nil)
+	intResult, isNull, err := intSig.evalInt(chunk.Row{})
 	c.Assert(err, IsNil)
 	c.Assert(isNull, IsFalse)
 	c.Assert(intResult, Equals, int64(11))
@@ -194,7 +195,7 @@ func (s *testEvaluatorSuite) TestArithmeticMinus(c *C) {
 	c.Assert(ok, IsTrue)
 	c.Assert(realSig, NotNil)
 
-	realResult, isNull, err := realSig.evalReal(nil)
+	realResult, isNull, err := realSig.evalReal(chunk.Row{})
 	c.Assert(err, IsNil)
 	c.Assert(isNull, IsFalse)
 	c.Assert(realResult, Equals, float64(1.02001))
@@ -209,7 +210,7 @@ func (s *testEvaluatorSuite) TestArithmeticMinus(c *C) {
 	c.Assert(ok, IsTrue)
 	c.Assert(realSig, NotNil)
 
-	realResult, isNull, err = realSig.evalReal(nil)
+	realResult, isNull, err = realSig.evalReal(chunk.Row{})
 	c.Assert(err, IsNil)
 	c.Assert(isNull, IsTrue)
 	c.Assert(realResult, Equals, float64(0))
@@ -224,7 +225,7 @@ func (s *testEvaluatorSuite) TestArithmeticMinus(c *C) {
 	c.Assert(ok, IsTrue)
 	c.Assert(realSig, NotNil)
 
-	realResult, isNull, err = realSig.evalReal(nil)
+	realResult, isNull, err = realSig.evalReal(chunk.Row{})
 	c.Assert(err, IsNil)
 	c.Assert(isNull, IsTrue)
 	c.Assert(realResult, Equals, float64(0))
@@ -239,7 +240,7 @@ func (s *testEvaluatorSuite) TestArithmeticMinus(c *C) {
 	c.Assert(ok, IsTrue)
 	c.Assert(realSig, NotNil)
 
-	realResult, isNull, err = realSig.evalReal(nil)
+	realResult, isNull, err = realSig.evalReal(chunk.Row{})
 	c.Assert(err, IsNil)
 	c.Assert(isNull, IsTrue)
 	c.Assert(realResult, Equals, float64(0))
@@ -282,7 +283,7 @@ func (s *testEvaluatorSuite) TestArithmeticMultiply(c *C) {
 		sig, err := funcs[ast.Mul].getFunction(s.ctx, s.datumsToConstants(types.MakeDatums(tc.args...)))
 		c.Assert(err, IsNil)
 		c.Assert(sig, NotNil)
-		val, err := evalBuiltinFunc(sig, nil)
+		val, err := evalBuiltinFunc(sig, chunk.Row{})
 		c.Assert(err, IsNil)
 		c.Assert(val, testutil.DatumEquals, types.NewDatum(tc.expect))
 	}
@@ -344,7 +345,7 @@ func (s *testEvaluatorSuite) TestArithmeticDivide(c *C) {
 		sig, err := funcs[ast.Div].getFunction(s.ctx, s.datumsToConstants(types.MakeDatums(tc.args...)))
 		c.Assert(err, IsNil)
 		c.Assert(sig, NotNil)
-		val, err := evalBuiltinFunc(sig, nil)
+		val, err := evalBuiltinFunc(sig, chunk.Row{})
 		c.Assert(err, IsNil)
 		c.Assert(val, testutil.DatumEquals, types.NewDatum(tc.expect))
 	}
@@ -354,83 +355,91 @@ func (s *testEvaluatorSuite) TestArithmeticIntDivide(c *C) {
 	defer testleak.AfterTest(c)()
 	testCases := []struct {
 		args   []interface{}
-		expect interface{}
+		expect []interface{}
 	}{
 		{
 			args:   []interface{}{int64(13), int64(11)},
-			expect: int64(1),
+			expect: []interface{}{int64(1), nil},
 		},
 		{
 			args:   []interface{}{int64(-13), int64(11)},
-			expect: int64(-1),
+			expect: []interface{}{int64(-1), nil},
 		},
 		{
 			args:   []interface{}{int64(13), int64(-11)},
-			expect: int64(-1),
+			expect: []interface{}{int64(-1), nil},
 		},
 		{
 			args:   []interface{}{int64(-13), int64(-11)},
-			expect: int64(1),
+			expect: []interface{}{int64(1), nil},
 		},
 		{
 			args:   []interface{}{int64(33), int64(11)},
-			expect: int64(3),
+			expect: []interface{}{int64(3), nil},
 		},
 		{
 			args:   []interface{}{int64(-33), int64(11)},
-			expect: int64(-3),
+			expect: []interface{}{int64(-3), nil},
 		},
 		{
 			args:   []interface{}{int64(33), int64(-11)},
-			expect: int64(-3),
+			expect: []interface{}{int64(-3), nil},
 		},
 		{
 			args:   []interface{}{int64(-33), int64(-11)},
-			expect: int64(3),
+			expect: []interface{}{int64(3), nil},
 		},
 		{
 			args:   []interface{}{int64(11), int64(0)},
-			expect: nil,
+			expect: []interface{}{nil, nil},
 		},
 		{
 			args:   []interface{}{int64(-11), int64(0)},
-			expect: nil,
+			expect: []interface{}{nil, nil},
 		},
 		{
 			args:   []interface{}{float64(11.01), float64(1.1)},
-			expect: int64(10),
+			expect: []interface{}{int64(10), nil},
 		},
 		{
 			args:   []interface{}{float64(-11.01), float64(1.1)},
-			expect: int64(-10),
+			expect: []interface{}{int64(-10), nil},
 		},
 		{
 			args:   []interface{}{float64(11.01), float64(-1.1)},
-			expect: int64(-10),
+			expect: []interface{}{int64(-10), nil},
 		},
 		{
 			args:   []interface{}{float64(-11.01), float64(-1.1)},
-			expect: int64(10),
+			expect: []interface{}{int64(10), nil},
 		},
 		{
 			args:   []interface{}{nil, float64(-0.11101)},
-			expect: nil,
+			expect: []interface{}{nil, nil},
 		},
 		{
 			args:   []interface{}{float64(1.01), nil},
-			expect: nil,
+			expect: []interface{}{nil, nil},
 		},
 		{
 			args:   []interface{}{nil, int64(-1001)},
-			expect: nil,
+			expect: []interface{}{nil, nil},
 		},
 		{
 			args:   []interface{}{int64(101), nil},
-			expect: nil,
+			expect: []interface{}{nil, nil},
 		},
 		{
 			args:   []interface{}{nil, nil},
-			expect: nil,
+			expect: []interface{}{nil, nil},
+		},
+		{
+			args:   []interface{}{float64(123456789100000.0), float64(-0.00001)},
+			expect: []interface{}{nil, "*BIGINT value is out of range in '\\(123456789100000 DIV -0.00001\\)'"},
+		},
+		{
+			args:   []interface{}{int64(-9223372036854775808), float64(-1)},
+			expect: []interface{}{nil, "*BIGINT value is out of range in '\\(-9223372036854775808 DIV -1\\)'"},
 		},
 	}
 
@@ -438,9 +447,13 @@ func (s *testEvaluatorSuite) TestArithmeticIntDivide(c *C) {
 		sig, err := funcs[ast.IntDiv].getFunction(s.ctx, s.datumsToConstants(types.MakeDatums(tc.args...)))
 		c.Assert(err, IsNil)
 		c.Assert(sig, NotNil)
-		val, err := evalBuiltinFunc(sig, nil)
-		c.Assert(err, IsNil)
-		c.Assert(val, testutil.DatumEquals, types.NewDatum(tc.expect))
+		val, err := evalBuiltinFunc(sig, chunk.Row{})
+		if tc.expect[1] == nil {
+			c.Assert(err, IsNil)
+			c.Assert(val, testutil.DatumEquals, types.NewDatum(tc.expect[0]))
+		} else {
+			c.Assert(err, ErrorMatches, tc.expect[1])
+		}
 	}
 }
 
@@ -548,7 +561,7 @@ func (s *testEvaluatorSuite) TestArithmeticMod(c *C) {
 		sig, err := funcs[ast.Mod].getFunction(s.ctx, s.datumsToConstants(types.MakeDatums(tc.args...)))
 		c.Assert(err, IsNil)
 		c.Assert(sig, NotNil)
-		val, err := evalBuiltinFunc(sig, nil)
+		val, err := evalBuiltinFunc(sig, chunk.Row{})
 		c.Assert(err, IsNil)
 		c.Assert(val, testutil.DatumEquals, types.NewDatum(tc.expect))
 	}

@@ -15,17 +15,18 @@ package privileges_test
 
 import (
 	"fmt"
+	"strings"
 	"testing"
 
 	. "github.com/pingcap/check"
+	"github.com/pingcap/parser/auth"
+	"github.com/pingcap/parser/mysql"
+	"github.com/pingcap/tidb/domain"
 	"github.com/pingcap/tidb/kv"
-	"github.com/pingcap/tidb/mysql"
 	"github.com/pingcap/tidb/privilege"
-	"github.com/pingcap/tidb/privilege/privileges"
 	"github.com/pingcap/tidb/session"
 	"github.com/pingcap/tidb/sessionctx"
 	"github.com/pingcap/tidb/store/mockstore"
-	"github.com/pingcap/tidb/util/auth"
 	"github.com/pingcap/tidb/util/testleak"
 	"github.com/pingcap/tidb/util/testutil"
 	"golang.org/x/net/context"
@@ -40,6 +41,7 @@ var _ = Suite(&testPrivilegeSuite{})
 
 type testPrivilegeSuite struct {
 	store  kv.Storage
+	dom    *domain.Domain
 	dbName string
 
 	createDBSQL              string
@@ -55,15 +57,19 @@ type testPrivilegeSuite struct {
 }
 
 func (s *testPrivilegeSuite) SetUpSuite(c *C) {
+	testleak.BeforeTest()
+	s.dbName = "test"
+	s.dom, s.store = newStore(c, s.dbName)
+}
+
+func (s *testPrivilegeSuite) TearDownSuite(c *C) {
+	s.dom.Close()
+	s.store.Close()
+	testleak.AfterTest(c)()
 }
 
 func (s *testPrivilegeSuite) SetUpTest(c *C) {
-	privileges.Enable = true
-	s.dbName = "test"
-	s.store = newStore(c, s.dbName)
 	se := newSession(c, s.store, s.dbName)
-	_, err := session.BootstrapSession(s.store)
-	c.Assert(err, IsNil)
 	s.createDBSQL = fmt.Sprintf("create database if not exists %s;", s.dbName)
 	s.createDB1SQL = fmt.Sprintf("create database if not exists %s1;", s.dbName)
 	s.dropDBSQL = fmt.Sprintf("drop database if exists %s;", s.dbName)
@@ -95,7 +101,6 @@ func (s *testPrivilegeSuite) TearDownTest(c *C) {
 }
 
 func (s *testPrivilegeSuite) TestCheckDBPrivilege(c *C) {
-	defer testleak.AfterTest(c)()
 	rootSe := newSession(c, s.store, s.dbName)
 	mustExec(c, rootSe, `CREATE USER 'testcheck'@'localhost';`)
 	mustExec(c, rootSe, `FLUSH PRIVILEGES;`)
@@ -116,7 +121,6 @@ func (s *testPrivilegeSuite) TestCheckDBPrivilege(c *C) {
 }
 
 func (s *testPrivilegeSuite) TestCheckTablePrivilege(c *C) {
-	defer testleak.AfterTest(c)()
 	rootSe := newSession(c, s.store, s.dbName)
 	mustExec(c, rootSe, `CREATE USER 'test1'@'localhost';`)
 	mustExec(c, rootSe, `FLUSH PRIVILEGES;`)
@@ -142,8 +146,8 @@ func (s *testPrivilegeSuite) TestCheckTablePrivilege(c *C) {
 }
 
 func (s *testPrivilegeSuite) TestShowGrants(c *C) {
-	defer testleak.AfterTest(c)()
 	se := newSession(c, s.store, s.dbName)
+	ctx, _ := se.(sessionctx.Context)
 	mustExec(c, se, `CREATE USER 'show'@'localhost' identified by '123';`)
 	mustExec(c, se, `GRANT Index ON *.* TO  'show'@'localhost';`)
 	mustExec(c, se, `FLUSH PRIVILEGES;`)
@@ -219,22 +223,28 @@ func (s *testPrivilegeSuite) TestShowGrants(c *C) {
 		`GRANT Update ON test.test TO 'show'@'localhost'`}
 	c.Assert(testutil.CompareUnorderedStringSlice(gs, expected), IsTrue)
 
-	// Fix a issue that empty privileges is displayed when revoke after grant.
-	mustExec(c, se, "TRUNCATE TABLE mysql.db")
-	mustExec(c, se, "TRUNCATE TABLE mysql.user")
-	mustExec(c, se, "TRUNCATE TABLE mysql.tables_priv")
-	mustExec(c, se, `GRANT ALL PRIVILEGES ON `+"`"+`te%`+"`"+`.* TO 'show'@'localhost'`)
-	mustExec(c, se, `REVOKE ALL PRIVILEGES ON `+"`"+`te%`+"`"+`.* FROM 'show'@'localhost'`)
+	// Expected behavior: Usage still exists after revoking all privileges
+	mustExec(c, se, `REVOKE ALL PRIVILEGES ON *.* FROM 'show'@'localhost'`)
+	mustExec(c, se, `REVOKE Select on test.* FROM 'show'@'localhost'`)
+	mustExec(c, se, `REVOKE ALL ON test1.* FROM 'show'@'localhost'`)
+	mustExec(c, se, `REVOKE UPDATE on test.test FROM 'show'@'localhost'`)
 	mustExec(c, se, `FLUSH PRIVILEGES;`)
 	gs, err = pc.ShowGrants(se, &auth.UserIdentity{Username: "show", Hostname: "localhost"})
 	c.Assert(err, IsNil)
-	// It should not be "GRANT ON `te%`.* to 'show'@'localhost'"
-	c.Assert(gs, HasLen, 0)
+	c.Assert(gs, HasLen, 1)
+	c.Assert(gs[0], Equals, `GRANT USAGE ON *.* TO 'show'@'localhost'`)
 
+	// Usage should not exist after dropping the user
+	// Which we need privileges to do so!
+	ctx.GetSessionVars().User = &auth.UserIdentity{Username: "root", Hostname: "localhost"}
+	mustExec(c, se, `DROP USER 'show'@'localhost'`)
+	mustExec(c, se, `FLUSH PRIVILEGES;`)
+	gs, err = pc.ShowGrants(se, &auth.UserIdentity{Username: "show", Hostname: "localhost"})
+	c.Assert(err, IsNil)
+	c.Assert(gs, HasLen, 0)
 }
 
 func (s *testPrivilegeSuite) TestDropTablePriv(c *C) {
-	defer testleak.AfterTest(c)()
 	se := newSession(c, s.store, s.dbName)
 	ctx, _ := se.(sessionctx.Context)
 	mustExec(c, se, `CREATE TABLE todrop(c int);`)
@@ -261,7 +271,6 @@ func (s *testPrivilegeSuite) TestDropTablePriv(c *C) {
 }
 
 func (s *testPrivilegeSuite) TestCheckAuthenticate(c *C) {
-	defer testleak.AfterTest(c)()
 
 	se := newSession(c, s.store, s.dbName)
 	mustExec(c, se, `CREATE USER 'u1'@'localhost';`)
@@ -291,7 +300,6 @@ func (s *testPrivilegeSuite) TestCheckAuthenticate(c *C) {
 }
 
 func (s *testPrivilegeSuite) TestInformationSchema(c *C) {
-	defer testleak.AfterTest(c)()
 
 	// This test tests no privilege check for INFORMATION_SCHEMA database.
 	se := newSession(c, s.store, s.dbName)
@@ -302,19 +310,37 @@ func (s *testPrivilegeSuite) TestInformationSchema(c *C) {
 	mustExec(c, se, `select * from information_schema.key_column_usage`)
 }
 
+func (s *testPrivilegeSuite) TestAdminCommand(c *C) {
+	se := newSession(c, s.store, s.dbName)
+	c.Assert(se.Auth(&auth.UserIdentity{Username: "root", Hostname: "localhost"}, nil, nil), IsTrue)
+	mustExec(c, se, `CREATE USER 'test_admin'@'localhost';`)
+	mustExec(c, se, `FLUSH PRIVILEGES;`)
+	mustExec(c, se, `CREATE TABLE t(a int)`)
+
+	c.Assert(se.Auth(&auth.UserIdentity{Username: "test_admin", Hostname: "localhost"}, nil, nil), IsTrue)
+	_, err := se.Execute(context.Background(), "ADMIN SHOW DDL JOBS")
+	c.Assert(strings.Contains(err.Error(), "privilege check fail"), IsTrue)
+	_, err = se.Execute(context.Background(), "ADMIN CHECK TABLE t")
+	c.Assert(strings.Contains(err.Error(), "privilege check fail"), IsTrue)
+
+	c.Assert(se.Auth(&auth.UserIdentity{Username: "root", Hostname: "localhost"}, nil, nil), IsTrue)
+	_, err = se.Execute(context.Background(), "ADMIN SHOW DDL JOBS")
+	c.Assert(err, IsNil)
+}
+
 func mustExec(c *C, se session.Session, sql string) {
 	_, err := se.Execute(context.Background(), sql)
 	c.Assert(err, IsNil)
 }
 
-func newStore(c *C, dbPath string) kv.Storage {
+func newStore(c *C, dbPath string) (*domain.Domain, kv.Storage) {
 	store, err := mockstore.NewMockTikvStore()
 	session.SetSchemaLease(0)
 	session.SetStatsLease(0)
 	c.Assert(err, IsNil)
-	_, err = session.BootstrapSession(store)
+	dom, err := session.BootstrapSession(store)
 	c.Assert(err, IsNil)
-	return store
+	return dom, store
 }
 
 func newSession(c *C, store kv.Storage, dbName string) session.Session {

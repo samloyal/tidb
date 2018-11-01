@@ -19,23 +19,24 @@ import (
 	"time"
 
 	"github.com/golang/protobuf/proto"
-	"github.com/juju/errors"
 	"github.com/pingcap/kvproto/pkg/coprocessor"
 	"github.com/pingcap/kvproto/pkg/errorpb"
 	"github.com/pingcap/kvproto/pkg/kvrpcpb"
 	"github.com/pingcap/kvproto/pkg/tikvpb"
+	"github.com/pingcap/parser/model"
+	"github.com/pingcap/parser/mysql"
+	"github.com/pingcap/parser/terror"
 	"github.com/pingcap/tidb/expression"
 	"github.com/pingcap/tidb/expression/aggregation"
 	"github.com/pingcap/tidb/kv"
-	"github.com/pingcap/tidb/model"
-	"github.com/pingcap/tidb/mysql"
 	"github.com/pingcap/tidb/sessionctx/stmtctx"
 	"github.com/pingcap/tidb/tablecodec"
-	"github.com/pingcap/tidb/terror"
 	"github.com/pingcap/tidb/types"
 	"github.com/pingcap/tidb/util/codec"
 	mockpkg "github.com/pingcap/tidb/util/mock"
-	tipb "github.com/pingcap/tipb/go-tipb"
+	"github.com/pingcap/tidb/util/timeutil"
+	"github.com/pingcap/tipb/go-tipb"
+	"github.com/pkg/errors"
 	"golang.org/x/net/context"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/metadata"
@@ -99,8 +100,13 @@ func (h *rpcHandler) buildDAGExecutor(req *coprocessor.Request) (*dagContext, ex
 	if err != nil {
 		return nil, nil, nil, errors.Trace(err)
 	}
+
 	sc := flagsToStatementContext(dagReq.Flags)
-	sc.TimeZone = time.FixedZone("UTC", int(dagReq.TimeZoneOffset))
+	sc.TimeZone, err = constructTimeZone(dagReq.TimeZoneName, int(dagReq.TimeZoneOffset))
+	if err != nil {
+		return nil, nil, nil, errors.Trace(err)
+	}
+
 	ctx := &dagContext{
 		dagReq:    dagReq,
 		keyRanges: req.Ranges,
@@ -113,16 +119,28 @@ func (h *rpcHandler) buildDAGExecutor(req *coprocessor.Request) (*dagContext, ex
 	return ctx, e, dagReq, err
 }
 
+// constructTimeZone constructs timezone by name first. When the timezone name
+// is set, the daylight saving problem must be considered. Otherwise the
+// timezone offset in seconds east of UTC is used to constructed the timezone.
+func constructTimeZone(name string, offset int) (*time.Location, error) {
+	if name != "" {
+		return timeutil.LoadLocation(name)
+	}
+
+	return time.FixedZone("", offset), nil
+}
+
 func (h *rpcHandler) handleCopStream(ctx context.Context, req *coprocessor.Request) (tikvpb.Tikv_CoprocessorStreamClient, error) {
-	_, e, dagReq, err := h.buildDAGExecutor(req)
+	dagCtx, e, dagReq, err := h.buildDAGExecutor(req)
 	if err != nil {
 		return nil, errors.Trace(err)
 	}
 
 	return &mockCopStreamClient{
-		exec: e,
-		req:  dagReq,
-		ctx:  ctx,
+		exec:   e,
+		req:    dagReq,
+		ctx:    ctx,
+		dagCtx: dagCtx,
 	}, nil
 }
 
@@ -383,26 +401,12 @@ func (e *evalContext) decodeRelatedColumnVals(relatedColOffsets []int, value [][
 	return nil
 }
 
-// Flags are used by tipb.SelectRequest.Flags to handle execution mode, like how to handle truncate error.
-const (
-	// FlagIgnoreTruncate indicates if truncate error should be ignored.
-	// Read-only statements should ignore truncate error, write statements should not ignore truncate error.
-	FlagIgnoreTruncate uint64 = 1
-	// FlagTruncateAsWarning indicates if truncate error should be returned as warning.
-	// This flag only matters if FlagIgnoreTruncate is not set, in strict sql mode, truncate error should
-	// be returned as error, in non-strict sql mode, truncate error should be saved as warning.
-	FlagTruncateAsWarning uint64 = 1 << 1
-
-	// FlagPadCharToFullLength indicates if sql_mode 'PAD_CHAR_TO_FULL_LENGTH' is set.
-	FlagPadCharToFullLength uint64 = 1 << 2
-)
-
 // flagsToStatementContext creates a StatementContext from a `tipb.SelectRequest.Flags`.
 func flagsToStatementContext(flags uint64) *stmtctx.StatementContext {
 	sc := new(stmtctx.StatementContext)
-	sc.IgnoreTruncate = (flags & FlagIgnoreTruncate) > 0
-	sc.TruncateAsWarning = (flags & FlagTruncateAsWarning) > 0
-	sc.PadCharToFullLength = (flags & FlagPadCharToFullLength) > 0
+	sc.IgnoreTruncate = (flags & model.FlagIgnoreTruncate) > 0
+	sc.TruncateAsWarning = (flags & model.FlagTruncateAsWarning) > 0
+	sc.PadCharToFullLength = (flags & model.FlagPadCharToFullLength) > 0
 	return sc
 }
 
@@ -427,6 +431,7 @@ type mockCopStreamClient struct {
 	req      *tipb.DAGRequest
 	exec     executor
 	ctx      context.Context
+	dagCtx   *dagContext
 	finished bool
 }
 
@@ -459,7 +464,7 @@ func (mock *mockCopStreamClient) Recv() (*coprocessor.Response, error) {
 
 	var resp coprocessor.Response
 	counts := make([]int64, len(mock.req.Executors))
-	chunk, finish, ran, counts, err := mock.readBlockFromExecutor()
+	chunk, finish, ran, counts, warnings, err := mock.readBlockFromExecutor()
 	resp.Range = ran
 	if err != nil {
 		if locked, ok := errors.Cause(err).(*ErrLocked); ok {
@@ -484,10 +489,17 @@ func (mock *mockCopStreamClient) Recv() (*coprocessor.Response, error) {
 		resp.OtherError = err.Error()
 		return &resp, nil
 	}
+	var Warnings []*tipb.Error
+	if len(warnings) > 0 {
+		Warnings = make([]*tipb.Error, 0, len(warnings))
+		for i := range warnings {
+			Warnings = append(Warnings, toPBError(warnings[i].Err))
+		}
+	}
 	streamResponse := tipb.StreamResponse{
-		Error:      toPBError(err),
-		EncodeType: tipb.EncodeType_TypeDefault,
-		Data:       data,
+		Error:    toPBError(err),
+		Data:     data,
+		Warnings: Warnings,
 	}
 	// The counts was the output count of each executor, but now it is the scan count of each range,
 	// so we need a flag to tell them apart.
@@ -503,7 +515,7 @@ func (mock *mockCopStreamClient) Recv() (*coprocessor.Response, error) {
 	return &resp, nil
 }
 
-func (mock *mockCopStreamClient) readBlockFromExecutor() (tipb.Chunk, bool, *coprocessor.KeyRange, []int64, error) {
+func (mock *mockCopStreamClient) readBlockFromExecutor() (tipb.Chunk, bool, *coprocessor.KeyRange, []int64, []stmtctx.SQLWarn, error) {
 	var chunk tipb.Chunk
 	var ran coprocessor.KeyRange
 	var finish bool
@@ -514,7 +526,7 @@ func (mock *mockCopStreamClient) readBlockFromExecutor() (tipb.Chunk, bool, *cop
 		row, err := mock.exec.Next(mock.ctx)
 		if err != nil {
 			ran.End, _ = mock.exec.Cursor()
-			return chunk, false, &ran, nil, errors.Trace(err)
+			return chunk, false, &ran, nil, nil, errors.Trace(err)
 		}
 		if row == nil {
 			finish = true
@@ -529,10 +541,12 @@ func (mock *mockCopStreamClient) readBlockFromExecutor() (tipb.Chunk, bool, *cop
 	if desc {
 		ran.Start, ran.End = ran.End, ran.Start
 	}
-	return chunk, finish, &ran, mock.exec.Counts(), nil
+	warnings := mock.dagCtx.evalCtx.sc.GetWarnings()
+	mock.dagCtx.evalCtx.sc.SetWarnings(nil)
+	return chunk, finish, &ran, mock.exec.Counts(), warnings, nil
 }
 
-func buildResp(chunks []tipb.Chunk, counts []int64, err error, warnings []error) *coprocessor.Response {
+func buildResp(chunks []tipb.Chunk, counts []int64, err error, warnings []stmtctx.SQLWarn) *coprocessor.Response {
 	resp := &coprocessor.Response{}
 	selResp := &tipb.SelectResponse{
 		Error:        toPBError(err),
@@ -542,7 +556,7 @@ func buildResp(chunks []tipb.Chunk, counts []int64, err error, warnings []error)
 	if len(warnings) > 0 {
 		selResp.Warnings = make([]*tipb.Error, 0, len(warnings))
 		for i := range warnings {
-			selResp.Warnings = append(selResp.Warnings, toPBError(warnings[i]))
+			selResp.Warnings = append(selResp.Warnings, toPBError(warnings[i].Err))
 		}
 	}
 	if err != nil {

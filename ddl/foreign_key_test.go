@@ -17,14 +17,14 @@ import (
 	"strings"
 	"sync"
 
-	"github.com/juju/errors"
 	. "github.com/pingcap/check"
-	"github.com/pingcap/tidb/ast"
+	"github.com/pingcap/parser/ast"
+	"github.com/pingcap/parser/model"
 	"github.com/pingcap/tidb/kv"
-	"github.com/pingcap/tidb/model"
 	"github.com/pingcap/tidb/sessionctx"
 	"github.com/pingcap/tidb/table"
 	"github.com/pingcap/tidb/util/testleak"
+	"github.com/pkg/errors"
 	"golang.org/x/net/context"
 )
 
@@ -78,7 +78,9 @@ func (s *testForeighKeySuite) testCreateForeignKey(c *C, tblInfo *model.TableInf
 		BinlogInfo: &model.HistoryInfo{},
 		Args:       []interface{}{fkInfo},
 	}
-	err := s.d.doDDLJob(s.ctx, job)
+	err := s.ctx.NewTxn()
+	c.Assert(err, IsNil)
+	err = s.d.doDDLJob(s.ctx, job)
 	c.Assert(err, IsNil)
 	return job
 }
@@ -156,7 +158,7 @@ func (s *testForeighKeySuite) TestForeignKey(c *C) {
 	d.SetHook(tc)
 
 	d.Stop()
-	d.start(context.Background())
+	d.start(context.Background(), nil)
 
 	job := s.testCreateForeignKey(c, tblInfo, "c1_fk", []string{"c1"}, "t2", []string{"c1"}, ast.ReferOptionCascade, ast.ReferOptionSetNull)
 	testCheckJobDone(c, d, job, true)
@@ -195,7 +197,7 @@ func (s *testForeighKeySuite) TestForeignKey(c *C) {
 	}
 
 	d.Stop()
-	d.start(context.Background())
+	d.start(context.Background(), nil)
 
 	job = testDropForeignKey(c, ctx, d, s.dbInfo, tblInfo, "c1_fk")
 	testCheckJobDone(c, d, job, false)
@@ -213,7 +215,7 @@ func (s *testForeighKeySuite) TestForeignKey(c *C) {
 	}
 
 	d.Stop()
-	d.start(context.Background())
+	d.start(context.Background(), nil)
 
 	job = testDropTable(c, ctx, d, s.dbInfo, tblInfo)
 	testCheckJobDone(c, d, job, false)

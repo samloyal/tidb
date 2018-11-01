@@ -15,14 +15,17 @@ package executor_test
 
 import (
 	"fmt"
+	"math"
 	"strings"
 	"time"
 
 	. "github.com/pingcap/check"
+	"github.com/pingcap/parser/model"
+	"github.com/pingcap/parser/mysql"
+	"github.com/pingcap/parser/terror"
 	"github.com/pingcap/tidb/domain"
-	"github.com/pingcap/tidb/model"
-	"github.com/pingcap/tidb/mysql"
-	"github.com/pingcap/tidb/plan"
+	plannercore "github.com/pingcap/tidb/planner/core"
+	"github.com/pingcap/tidb/sessionctx/variable"
 	"github.com/pingcap/tidb/table"
 	"github.com/pingcap/tidb/types"
 	"github.com/pingcap/tidb/util/chunk"
@@ -41,6 +44,23 @@ func (s *testSuite) TestTruncateTable(c *C) {
 	tk.MustExec("truncate table truncate_test")
 	result = tk.MustQuery("select * from truncate_test")
 	result.Check(nil)
+}
+
+// TestInTxnExecDDLFail tests the following case:
+//  1. Execute the SQL of "begin";
+//  2. A SQL that will fail to execute;
+//  3. Execute DDL.
+func (s *testSuite) TestInTxnExecDDLFail(c *C) {
+	tk := testkit.NewTestKit(c, s.store)
+	tk.MustExec("use test")
+	tk.MustExec("create table t (i int key);")
+	tk.MustExec("insert into t values (1);")
+	tk.MustExec("begin;")
+	tk.MustExec("insert into t values (1);")
+	_, err := tk.Exec("truncate table t;")
+	c.Assert(err.Error(), Equals, "[kv:1062]Duplicate entry '1' for key 'PRIMARY'")
+	result := tk.MustQuery("select count(*) from t")
+	result.Check(testkit.Rows("1"))
 }
 
 func (s *testSuite) TestCreateTable(c *C) {
@@ -122,9 +142,12 @@ func (s *testSuite) TestCreateDropDatabase(c *C) {
 	tk.MustExec("use drop_test;")
 	tk.MustExec("drop database drop_test;")
 	_, err := tk.Exec("drop table t;")
-	c.Assert(err.Error(), Equals, plan.ErrNoDB.Error())
+	c.Assert(err.Error(), Equals, plannercore.ErrNoDB.Error())
 	_, err = tk.Exec("select * from t;")
-	c.Assert(err.Error(), Equals, plan.ErrNoDB.Error())
+	c.Assert(err.Error(), Equals, plannercore.ErrNoDB.Error())
+
+	_, err = tk.Exec("drop database mysql")
+	c.Assert(err, NotNil)
 }
 
 func (s *testSuite) TestCreateDropTable(c *C) {
@@ -134,6 +157,9 @@ func (s *testSuite) TestCreateDropTable(c *C) {
 	tk.MustExec("drop table if exists drop_test")
 	tk.MustExec("create table drop_test (a int)")
 	tk.MustExec("drop table drop_test")
+
+	_, err := tk.Exec("drop table mysql.gc_delete_range")
+	c.Assert(err, NotNil)
 }
 
 func (s *testSuite) TestCreateDropIndex(c *C) {
@@ -372,4 +398,55 @@ func (s *testSuite) TestShardRowIDBits(c *C) {
 	c.Assert(err, IsNil)
 	c.Assert(count, Equals, 100)
 	c.Assert(hasShardedID, IsTrue)
+
+	// Test that audo_increment column can not use shard_row_id_bits.
+	_, err = tk.Exec("create table auto (id int not null auto_increment primary key) shard_row_id_bits = 4")
+	c.Assert(err, NotNil)
+	tk.MustExec("create table auto (id int not null auto_increment primary key) shard_row_id_bits = 0")
+	_, err = tk.Exec("alter table auto shard_row_id_bits = 4")
+	c.Assert(err, NotNil)
+	tk.MustExec("alter table auto shard_row_id_bits = 0")
+}
+
+func (s *testSuite) TestMaxHandleAddIndex(c *C) {
+	tk := testkit.NewTestKit(c, s.store)
+
+	tk.MustExec("use test")
+	tk.MustExec("create table t(a bigint PRIMARY KEY, b int)")
+	tk.MustExec(fmt.Sprintf("insert into t values(%v, 1)", math.MaxInt64))
+	tk.MustExec(fmt.Sprintf("insert into t values(%v, 1)", math.MinInt64))
+	tk.MustExec("alter table t add index idx_b(b)")
+	tk.MustExec("admin check table t")
+
+	tk.MustExec("create table t1(a bigint UNSIGNED PRIMARY KEY, b int)")
+	tk.MustExec(fmt.Sprintf("insert into t1 values(%v, 1)", uint64(math.MaxUint64)))
+	tk.MustExec(fmt.Sprintf("insert into t1 values(%v, 1)", 0))
+	tk.MustExec("alter table t1 add index idx_b(b)")
+	tk.MustExec("admin check table t1")
+}
+
+func (s *testSuite) TestSetDDLReorgWorkerCnt(c *C) {
+	tk := testkit.NewTestKit(c, s.store)
+	tk.MustExec("use test")
+	c.Assert(variable.GetDDLReorgWorkerCounter(), Equals, int32(variable.DefTiDBDDLReorgWorkerCount))
+	tk.MustExec("set tidb_ddl_reorg_worker_cnt = 1")
+	c.Assert(variable.GetDDLReorgWorkerCounter(), Equals, int32(1))
+	tk.MustExec("set tidb_ddl_reorg_worker_cnt = 100")
+	c.Assert(variable.GetDDLReorgWorkerCounter(), Equals, int32(100))
+	_, err := tk.Exec("set tidb_ddl_reorg_worker_cnt = invalid_val")
+	c.Assert(terror.ErrorEqual(err, variable.ErrWrongTypeForVar), IsTrue, Commentf("err %v", err))
+	tk.MustExec("set tidb_ddl_reorg_worker_cnt = 100")
+	c.Assert(variable.GetDDLReorgWorkerCounter(), Equals, int32(100))
+	_, err = tk.Exec("set tidb_ddl_reorg_worker_cnt = -1")
+	c.Assert(terror.ErrorEqual(err, variable.ErrWrongValueForVar), IsTrue, Commentf("err %v", err))
+
+	tk.MustExec("set tidb_ddl_reorg_worker_cnt = 100")
+	res := tk.MustQuery("select @@tidb_ddl_reorg_worker_cnt")
+	res.Check(testkit.Rows("100"))
+
+	res = tk.MustQuery("select @@global.tidb_ddl_reorg_worker_cnt")
+	res.Check(testkit.Rows(fmt.Sprintf("%v", variable.DefTiDBDDLReorgWorkerCount)))
+	tk.MustExec("set @@global.tidb_ddl_reorg_worker_cnt = 100")
+	res = tk.MustQuery("select @@global.tidb_ddl_reorg_worker_cnt")
+	res.Check(testkit.Rows("100"))
 }

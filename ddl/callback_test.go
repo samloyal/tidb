@@ -15,9 +15,26 @@ package ddl
 
 import (
 	. "github.com/pingcap/check"
-	"github.com/pingcap/tidb/model"
+	"github.com/pingcap/parser/model"
+	"github.com/pingcap/tidb/infoschema"
+	"github.com/pingcap/tidb/sessionctx"
+	log "github.com/sirupsen/logrus"
 	"golang.org/x/net/context"
 )
+
+type TestInterceptor struct {
+	*BaseInterceptor
+
+	OnGetInfoSchemaExported func(ctx sessionctx.Context, is infoschema.InfoSchema) infoschema.InfoSchema
+}
+
+func (ti *TestInterceptor) OnGetInfoSchema(ctx sessionctx.Context, is infoschema.InfoSchema) infoschema.InfoSchema {
+	if ti.OnGetInfoSchemaExported != nil {
+		return ti.OnGetInfoSchemaExported(ctx, is)
+	}
+
+	return ti.BaseInterceptor.OnGetInfoSchema(ctx, is)
+}
 
 type TestDDLCallback struct {
 	*BaseCallback
@@ -30,6 +47,7 @@ type TestDDLCallback struct {
 }
 
 func (tc *TestDDLCallback) OnJobRunBefore(job *model.Job) {
+	log.Infof("on job run before, job %v", job)
 	if tc.OnJobRunBeforeExported != nil {
 		tc.OnJobRunBeforeExported(job)
 		return
@@ -43,6 +61,7 @@ func (tc *TestDDLCallback) OnJobRunBefore(job *model.Job) {
 }
 
 func (tc *TestDDLCallback) OnJobUpdated(job *model.Job) {
+	log.Infof("on job updated, job %v", job)
 	if tc.OnJobUpdatedExported != nil {
 		tc.OnJobUpdatedExported(job)
 		return

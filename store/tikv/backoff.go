@@ -17,12 +17,14 @@ import (
 	"fmt"
 	"math"
 	"math/rand"
+	"strings"
 	"time"
 
-	"github.com/juju/errors"
+	"github.com/pingcap/parser/mysql"
+	"github.com/pingcap/parser/terror"
+	"github.com/pingcap/tidb/kv"
 	"github.com/pingcap/tidb/metrics"
-	"github.com/pingcap/tidb/mysql"
-	"github.com/pingcap/tidb/terror"
+	"github.com/pkg/errors"
 	log "github.com/sirupsen/logrus"
 	"golang.org/x/net/context"
 )
@@ -42,6 +44,10 @@ const (
 // optional jitters.
 // See http://www.awsarchitectureblog.com/2015/03/backoff.html
 func NewBackoffFn(base, cap, jitter int) func(ctx context.Context) int {
+	if base < 2 {
+		// Top prevent panic in 'rand.Intn'.
+		base = 2
+	}
 	attempts := 0
 	lastSleep := base
 	return func(ctx context.Context) int {
@@ -58,7 +64,7 @@ func NewBackoffFn(base, cap, jitter int) func(ctx context.Context) int {
 		case DecorrJitter:
 			sleep = int(math.Min(float64(cap), float64(base+rand.Intn(lastSleep*3-base))))
 		}
-
+		log.Debugf("backoff base %d, sleep %d", base, sleep)
 		select {
 		case <-time.After(time.Duration(sleep) * time.Millisecond):
 		case <-ctx.Done():
@@ -87,18 +93,22 @@ const (
 	boServerBusy
 )
 
-func (t backoffType) createFn() func(context.Context) int {
+func (t backoffType) createFn(vars *kv.Variables) func(context.Context) int {
+	if vars.Hook != nil {
+		vars.Hook(t.String(), vars)
+	}
 	switch t {
 	case boTiKVRPC:
 		return NewBackoffFn(100, 2000, EqualJitter)
 	case BoTxnLock:
 		return NewBackoffFn(200, 3000, EqualJitter)
 	case boTxnLockFast:
-		return NewBackoffFn(100, 3000, EqualJitter)
+		return NewBackoffFn(vars.BackoffLockFast, 3000, EqualJitter)
 	case boPDRPC:
 		return NewBackoffFn(500, 3000, EqualJitter)
 	case BoRegionMiss:
-		return NewBackoffFn(100, 500, NoJitter)
+		// change base time to 2ms, because it may recover soon.
+		return NewBackoffFn(2, 500, NoJitter)
 	case BoUpdateLeader:
 		return NewBackoffFn(1, 10, NoJitter)
 	case boServerBusy:
@@ -127,14 +137,14 @@ func (t backoffType) String() string {
 	return ""
 }
 
-func (t backoffType) TError() *terror.Error {
+func (t backoffType) TError() error {
 	switch t {
 	case boTiKVRPC:
 		return ErrTiKVServerTimeout
 	case BoTxnLock, boTxnLockFast:
 		return ErrResolveLockTimeout
 	case boPDRPC:
-		return ErrPDServerTimeout.GenByArgs(txnRetryableMark)
+		return ErrPDServerTimeout.GenWithStackByArgs(txnRetryableMark)
 	case BoRegionMiss, BoUpdateLeader:
 		return ErrRegionUnavailable
 	case boServerBusy:
@@ -145,19 +155,19 @@ func (t backoffType) TError() *terror.Error {
 
 // Maximum total sleep time(in ms) for kv/cop commands.
 const (
-	copBuildTaskMaxBackoff  = 5000
-	tsoMaxBackoff           = 5000
-	scannerNextMaxBackoff   = 20000
-	batchGetMaxBackoff      = 20000
-	copNextMaxBackoff       = 20000
-	getMaxBackoff           = 20000
-	prewriteMaxBackoff      = 20000
-	cleanupMaxBackoff       = 20000
-	GcOneRegionMaxBackoff   = 20000
-	GcResolveLockMaxBackoff = 100000
-	GcDeleteRangeMaxBackoff = 100000
-	rawkvMaxBackoff         = 20000
-	splitRegionBackoff      = 20000
+	copBuildTaskMaxBackoff         = 5000
+	tsoMaxBackoff                  = 15000
+	scannerNextMaxBackoff          = 20000
+	batchGetMaxBackoff             = 20000
+	copNextMaxBackoff              = 20000
+	getMaxBackoff                  = 20000
+	prewriteMaxBackoff             = 20000
+	cleanupMaxBackoff              = 20000
+	GcOneRegionMaxBackoff          = 20000
+	GcResolveLockMaxBackoff        = 100000
+	deleteRangeOneRegionMaxBackoff = 100000
+	rawkvMaxBackoff                = 20000
+	splitRegionBackoff             = 20000
 )
 
 // CommitMaxBackoff is max sleep time of the 'commit' command
@@ -165,28 +175,41 @@ var CommitMaxBackoff = 41000
 
 // Backoffer is a utility for retrying queries.
 type Backoffer struct {
-	context.Context
+	ctx context.Context
 
 	fn         map[backoffType]func(context.Context) int
 	maxSleep   int
 	totalSleep int
 	errors     []error
 	types      []backoffType
+	vars       *kv.Variables
 }
 
 // NewBackoffer creates a Backoffer with maximum sleep time(in ms).
 func NewBackoffer(ctx context.Context, maxSleep int) *Backoffer {
 	return &Backoffer{
-		Context:  ctx,
+		ctx:      ctx,
 		maxSleep: maxSleep,
+		vars:     kv.DefaultVars,
 	}
+}
+
+// WithVars sets the kv.Variables to the Backoffer and return it.
+func (b *Backoffer) WithVars(vars *kv.Variables) *Backoffer {
+	if vars != nil {
+		b.vars = vars
+	}
+	return b
 }
 
 // Backoff sleeps a while base on the backoffType and records the error message.
 // It returns a retryable error if total sleep time exceeds maxSleep.
 func (b *Backoffer) Backoff(typ backoffType, err error) error {
+	if strings.Contains(err.Error(), mismatchClusterID) {
+		log.Fatalf("critical error %v", err)
+	}
 	select {
-	case <-b.Context.Done():
+	case <-b.ctx.Done():
 		return errors.Trace(err)
 	default:
 	}
@@ -198,15 +221,16 @@ func (b *Backoffer) Backoff(typ backoffType, err error) error {
 	}
 	f, ok := b.fn[typ]
 	if !ok {
-		f = typ.createFn()
+		f = typ.createFn(b.vars)
 		b.fn[typ] = f
 	}
 
-	b.totalSleep += f(b)
+	b.totalSleep += f(b.ctx)
 	b.types = append(b.types, typ)
 
-	log.Debugf("%v, retry later(totalSleep %dms, maxSleep %dms)", err, b.totalSleep, b.maxSleep)
-	b.errors = append(b.errors, err)
+	log.Debugf("%v, retry later(totalsleep %dms, maxsleep %dms)", err, b.totalSleep, b.maxSleep)
+
+	b.errors = append(b.errors, errors.Errorf("%s at %s", err.Error(), time.Now().Format(time.RFC3339Nano)))
 	if b.maxSleep > 0 && b.totalSleep >= b.maxSleep {
 		errMsg := fmt.Sprintf("backoffer.maxSleep %dms is exceeded, errors:", b.maxSleep)
 		for i, err := range b.errors {
@@ -216,8 +240,8 @@ func (b *Backoffer) Backoff(typ backoffType, err error) error {
 			}
 		}
 		log.Warn(errMsg)
-		// Use the last backoff type to generate a MySQL error.
-		return typ.TError()
+		// Use the first backoff type to generate a MySQL error.
+		return b.types[0].TError()
 	}
 	return nil
 }
@@ -226,28 +250,30 @@ func (b *Backoffer) String() string {
 	if b.totalSleep == 0 {
 		return ""
 	}
-	return fmt.Sprintf(" backoff(%dms %s)", b.totalSleep, b.types)
+	return fmt.Sprintf(" backoff(%dms %v)", b.totalSleep, b.types)
 }
 
 // Clone creates a new Backoffer which keeps current Backoffer's sleep time and errors, and shares
 // current Backoffer's context.
 func (b *Backoffer) Clone() *Backoffer {
 	return &Backoffer{
-		Context:    b.Context,
+		ctx:        b.ctx,
 		maxSleep:   b.maxSleep,
 		totalSleep: b.totalSleep,
 		errors:     b.errors,
+		vars:       b.vars,
 	}
 }
 
 // Fork creates a new Backoffer which keeps current Backoffer's sleep time and errors, and holds
 // a child context of current Backoffer's context.
 func (b *Backoffer) Fork() (*Backoffer, context.CancelFunc) {
-	ctx, cancel := context.WithCancel(b.Context)
+	ctx, cancel := context.WithCancel(b.ctx)
 	return &Backoffer{
-		Context:    ctx,
+		ctx:        ctx,
 		maxSleep:   b.maxSleep,
 		totalSleep: b.totalSleep,
 		errors:     b.errors,
+		vars:       b.vars,
 	}, cancel
 }

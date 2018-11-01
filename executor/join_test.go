@@ -17,10 +17,9 @@ import (
 	"time"
 
 	. "github.com/pingcap/check"
-	"github.com/pingcap/tidb/plan"
+	plannercore "github.com/pingcap/tidb/planner/core"
 	"github.com/pingcap/tidb/session"
 	"github.com/pingcap/tidb/util/testkit"
-	"github.com/pingcap/tidb/util/testleak"
 	"golang.org/x/net/context"
 )
 
@@ -119,14 +118,14 @@ func (s *testSuite) TestJoin(c *C) {
 	result = tk.MustQuery("select a.c1 from t a , (select * from t1 limit 3) b where a.c1 = b.c1 order by b.c1;")
 	result.Check(testkit.Rows("1", "2", "3"))
 
-	plan.AllowCartesianProduct = false
+	plannercore.AllowCartesianProduct = false
 	_, err := tk.Exec("select * from t, t1")
-	c.Check(plan.ErrCartesianProductUnsupported.Equal(err), IsTrue)
+	c.Check(plannercore.ErrCartesianProductUnsupported.Equal(err), IsTrue)
 	_, err = tk.Exec("select * from t left join t1 on 1")
-	c.Check(plan.ErrCartesianProductUnsupported.Equal(err), IsTrue)
+	c.Check(plannercore.ErrCartesianProductUnsupported.Equal(err), IsTrue)
 	_, err = tk.Exec("select * from t right join t1 on 1")
-	c.Check(plan.ErrCartesianProductUnsupported.Equal(err), IsTrue)
-	plan.AllowCartesianProduct = true
+	c.Check(plannercore.ErrCartesianProductUnsupported.Equal(err), IsTrue)
+	plannercore.AllowCartesianProduct = true
 	tk.MustExec("drop table if exists t,t2,t1")
 	tk.MustExec("create table t(c1 int)")
 	tk.MustExec("create table t1(c1 int, c2 int)")
@@ -261,6 +260,23 @@ func (s *testSuite) TestJoin(c *C) {
 	tk.MustExec("create table user(id int, name varchar(20))")
 	tk.MustExec("insert into user values(1, 'a'), (2, 'b')")
 	tk.MustQuery("select user.id,user.name from user left join aa on aa.id = user.id left join bb on aa.id = bb.id where bb.id < 10;").Check(testkit.Rows("1 a"))
+
+	tk.MustExec(`drop table if exists t;`)
+	tk.MustExec(`create table t (a bigint);`)
+	tk.MustExec(`insert into t values (1);`)
+	tk.MustQuery(`select t2.a, t1.a from t t1 inner join (select "1" as a) t2 on t2.a = t1.a;`).Check(testkit.Rows("1 1"))
+	tk.MustQuery(`select t2.a, t1.a from t t1 inner join (select "2" as b, "1" as a) t2 on t2.a = t1.a;`).Check(testkit.Rows("1 1"))
+
+	tk.MustExec("drop table if exists t1, t2, t3, t4")
+	tk.MustExec("create table t1(a int, b int)")
+	tk.MustExec("create table t2(a int, b int)")
+	tk.MustExec("create table t3(a int, b int)")
+	tk.MustExec("create table t4(a int, b int)")
+	tk.MustExec("insert into t1 values(1, 1)")
+	tk.MustExec("insert into t2 values(1, 1)")
+	tk.MustExec("insert into t3 values(1, 1)")
+	tk.MustExec("insert into t4 values(1, 1)")
+	tk.MustQuery("select min(t2.b) from t1 right join t2 on t2.a=t1.a right join t3 on t2.a=t3.a left join t4 on t3.a=t4.a").Check(testkit.Rows("1"))
 }
 
 func (s *testSuite) TestJoinCast(c *C) {
@@ -503,6 +519,8 @@ func (s *testSuite) TestSubquerySameTable(c *C) {
 func (s *testSuite) TestSubquery(c *C) {
 	tk := testkit.NewTestKit(c, s.store)
 	tk.MustExec("set @@tidb_hash_join_concurrency=1")
+	tk.MustExec("set @@tidb_hashagg_partial_concurrency=1")
+	tk.MustExec("set @@tidb_hashagg_final_concurrency=1")
 	tk.MustExec("use test")
 	tk.MustExec("drop table if exists t")
 	tk.MustExec("create table t (c int, d int)")
@@ -668,9 +686,6 @@ func (s *testSuite) TestSubquery(c *C) {
 }
 
 func (s *testSuite) TestInSubquery(c *C) {
-	defer func() {
-		testleak.AfterTest(c)()
-	}()
 	tk := testkit.NewTestKit(c, s.store)
 	tk.MustExec("use test")
 	tk.MustExec("drop table if exists t")
@@ -711,14 +726,14 @@ func (s *testSuite) TestInSubquery(c *C) {
 	tk.MustExec("create table t2 (a int)")
 	tk.MustExec("insert into t1 values (1),(2)")
 	tk.MustExec("insert into t2 values (1),(2)")
-	tk.MustExec("set @@session.tidb_opt_insubquery_unfold = 1")
+	tk.MustExec("set @@session.tidb_opt_insubq_to_join_and_agg = 0")
 	result = tk.MustQuery("select * from t1 where a in (select * from t2)")
 	result.Sort().Check(testkit.Rows("1", "2"))
 	result = tk.MustQuery("select * from t1 where a in (select * from t2 where false)")
 	result.Check(testkit.Rows())
 	result = tk.MustQuery("select * from t1 where a not in (select * from t2 where false)")
 	result.Sort().Check(testkit.Rows("1", "2"))
-	tk.MustExec("set @@session.tidb_opt_insubquery_unfold = 0")
+	tk.MustExec("set @@session.tidb_opt_insubq_to_join_and_agg = 1")
 	result = tk.MustQuery("select * from t1 where a in (select * from t2)")
 	result.Sort().Check(testkit.Rows("1", "2"))
 	result = tk.MustQuery("select * from t1 where a in (select * from t2 where false)")
@@ -828,6 +843,27 @@ func (s *testSuite) TestIndexLookupJoin(c *C) {
 	tk.MustExec("CREATE TABLE t(a BIGINT PRIMARY KEY, b BIGINT);")
 	tk.MustExec("INSERT INTO t VALUES(1, 2);")
 	tk.MustQuery("SELECT /*+ TIDB_INLJ(t1, t2) */ * FROM t t1 JOIN t t2 ON t1.a=t2.a UNION ALL SELECT /*+ TIDB_INLJ(t1, t2) */ * FROM t t1 JOIN t t2 ON t1.a=t2.a;").Check(testkit.Rows("1 2 1 2", "1 2 1 2"))
+
+	tk.MustExec(`drop table if exists t;`)
+	tk.MustExec(`create table t(a decimal(6,2), index idx(a));`)
+	tk.MustExec(`insert into t values(1.01), (2.02), (NULL);`)
+	tk.MustQuery(`select /*+ TIDB_INLJ(t1) */ t1.a from t t1 join t t2 on t1.a=t2.a order by t1.a;`).Check(testkit.Rows(
+		`1.01`,
+		`2.02`,
+	))
+
+	tk.MustExec(`drop table if exists t;`)
+	tk.MustExec(`create table t(a bigint, b bigint, unique key idx1(a, b));`)
+	tk.MustExec(`insert into t values(1, 1), (1, 2), (1, 3), (1, 4), (1, 5), (1, 6);`)
+	tk.MustExec(`set @@tidb_max_chunk_size = 2;`)
+	tk.MustQuery(`select /*+ TIDB_INLJ(t1) */ * from t t1 left join t t2 on t1.a = t2.a and t1.b = t2.b + 4;`).Check(testkit.Rows(
+		`1 1 <nil> <nil>`,
+		`1 2 <nil> <nil>`,
+		`1 3 <nil> <nil>`,
+		`1 4 <nil> <nil>`,
+		`1 5 1 1`,
+		`1 6 1 2`,
+	))
 }
 
 func (s *testSuite) TestMergejoinOrder(c *C) {
@@ -840,11 +876,11 @@ func (s *testSuite) TestMergejoinOrder(c *C) {
 	tk.MustExec("insert into t2 select a*100, b*100 from t1;")
 
 	tk.MustQuery("explain select /*+ TIDB_SMJ(t2) */ * from t1 left outer join t2 on t1.a=t2.a and t1.a!=3 order by t1.a;").Check(testkit.Rows(
-		"TableScan_10   cop table:t1, range:[-inf,+inf], keep order:true 10000.00",
-		"TableReader_11 MergeJoin_15  root data:TableScan_10 10000.00",
-		"TableScan_12   cop table:t2, range:[-inf,+inf], keep order:true 10000.00",
-		"TableReader_13 MergeJoin_15  root data:TableScan_12 10000.00",
-		"MergeJoin_15  TableReader_11,TableReader_13 root left outer join, equal:[eq(test.t1.a, test.t2.a)], left cond:[ne(test.t1.a, 3)], left key:test.t1.a, right key:test.t2.a 12500.00",
+		"MergeJoin_15 10000.00 root left outer join, left key:test.t1.a, right key:test.t2.a, left cond:[ne(test.t1.a, 3)]",
+		"├─TableReader_11 10000.00 root data:TableScan_10",
+		"│ └─TableScan_10 10000.00 cop table:t1, range:[-inf,+inf], keep order:true, stats:pseudo",
+		"└─TableReader_13 6666.67 root data:TableScan_12",
+		"  └─TableScan_12 6666.67 cop table:t2, range:[-inf,3), (3,+inf], keep order:true, stats:pseudo",
 	))
 
 	tk.MustExec("set @@tidb_max_chunk_size=1")
@@ -855,4 +891,33 @@ func (s *testSuite) TestMergejoinOrder(c *C) {
 		"4 100 <nil> <nil>",
 		"5 100 <nil> <nil>",
 	))
+
+	tk.MustExec(`drop table if exists t;`)
+	tk.MustExec(`create table t(a bigint, b bigint, index idx_1(a,b));`)
+	tk.MustExec(`insert into t values(1, 1), (1, 2), (2, 1), (2, 2);`)
+	tk.MustQuery(`select /*+ TIDB_SMJ(t1, t2) */ * from t t1 join t t2 on t1.b = t2.b and t1.a=t2.a;`).Check(testkit.Rows(
+		`1 1 1 1`,
+		`1 2 1 2`,
+		`2 1 2 1`,
+		`2 2 2 2`,
+	))
+
+	tk.MustExec(`drop table if exists t;`)
+	tk.MustExec(`create table t(a decimal(6,2), index idx(a));`)
+	tk.MustExec(`insert into t values(1.01), (2.02), (NULL);`)
+	tk.MustQuery(`select /*+ TIDB_SMJ(t1) */ t1.a from t t1 join t t2 on t1.a=t2.a order by t1.a;`).Check(testkit.Rows(
+		`1.01`,
+		`2.02`,
+	))
+}
+
+func (s *testSuite) TestEmbeddedOuterJoin(c *C) {
+	tk := testkit.NewTestKit(c, s.store)
+	tk.MustExec("use test")
+	tk.MustExec("drop table if exists t1, t2")
+	tk.MustExec("create table t1(a int, b int)")
+	tk.MustExec("create table t2(a int, b int)")
+	tk.MustExec("insert into t1 values(1, 1)")
+	tk.MustQuery("select * from (t1 left join t2 on t1.a = t2.a) left join (t2 t3 left join t2 t4 on t3.a = t4.a) on t2.b = 1").
+		Check(testkit.Rows("1 1 <nil> <nil> <nil> <nil> <nil> <nil>"))
 }

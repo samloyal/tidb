@@ -15,8 +15,9 @@ package privileges_test
 
 import (
 	. "github.com/pingcap/check"
+	"github.com/pingcap/parser/mysql"
+	"github.com/pingcap/tidb/domain"
 	"github.com/pingcap/tidb/kv"
-	"github.com/pingcap/tidb/mysql"
 	"github.com/pingcap/tidb/privilege/privileges"
 	"github.com/pingcap/tidb/session"
 	"github.com/pingcap/tidb/store/mockstore"
@@ -27,20 +28,21 @@ var _ = Suite(&testCacheSuite{})
 type testCacheSuite struct {
 	store  kv.Storage
 	dbName string
+	domain *domain.Domain
 }
 
 func (s *testCacheSuite) SetUpSuite(c *C) {
-	privileges.Enable = true
 	store, err := mockstore.NewMockTikvStore()
 	session.SetSchemaLease(0)
 	session.SetStatsLease(0)
 	c.Assert(err, IsNil)
-	_, err = session.BootstrapSession(store)
+	s.domain, err = session.BootstrapSession(store)
 	c.Assert(err, IsNil)
 	s.store = store
 }
 
-func (s *testCacheSuite) TearDown(c *C) {
+func (s *testCacheSuite) TearDownSuit(c *C) {
+	s.domain.Close()
 	s.store.Close()
 }
 
@@ -184,14 +186,15 @@ func (s *testCacheSuite) TestCaseInsensitive(c *C) {
 }
 
 func (s *testCacheSuite) TestAbnormalMySQLTable(c *C) {
-	privileges.Enable = true
 	store, err := mockstore.NewMockTikvStore()
+	c.Assert(err, IsNil)
+	defer store.Close()
 	session.SetSchemaLease(0)
 	session.SetStatsLease(0)
+
+	dom, err := session.BootstrapSession(store)
 	c.Assert(err, IsNil)
-	domain, err := session.BootstrapSession(store)
-	c.Assert(err, IsNil)
-	defer domain.Close()
+	defer dom.Close()
 
 	se, err := session.CreateSession4Test(store)
 	c.Assert(err, IsNil)
@@ -260,4 +263,52 @@ func (s *testCacheSuite) TestAbnormalMySQLTable(c *C) {
 	mustExec(c, se, "DROP TABLE mysql.columns_priv;")
 	err = p.LoadAll(se)
 	c.Assert(err, IsNil)
+}
+
+func (s *testCacheSuite) TestSortUserTable(c *C) {
+	var p privileges.MySQLPrivilege
+	p.User = []privileges.UserRecord{
+		{Host: `%`, User: "root"},
+		{Host: `%`, User: "jeffrey"},
+		{Host: "localhost", User: "root"},
+		{Host: "localhost", User: ""},
+	}
+	p.SortUserTable()
+	result := []privileges.UserRecord{
+		{Host: "localhost", User: "root"},
+		{Host: "localhost", User: ""},
+		{Host: `%`, User: "jeffrey"},
+		{Host: `%`, User: "root"},
+	}
+	checkUserRecord(p.User, result, c)
+
+	p.User = []privileges.UserRecord{
+		{Host: `%`, User: "jeffrey"},
+		{Host: "h1.example.net", User: ""},
+	}
+	p.SortUserTable()
+	result = []privileges.UserRecord{
+		{Host: "h1.example.net", User: ""},
+		{Host: `%`, User: "jeffrey"},
+	}
+	checkUserRecord(p.User, result, c)
+
+	p.User = []privileges.UserRecord{
+		{Host: `192.168.%`, User: "xxx"},
+		{Host: `192.168.199.%`, User: "xxx"},
+	}
+	p.SortUserTable()
+	result = []privileges.UserRecord{
+		{Host: `192.168.199.%`, User: "xxx"},
+		{Host: `192.168.%`, User: "xxx"},
+	}
+	checkUserRecord(p.User, result, c)
+}
+
+func checkUserRecord(x, y []privileges.UserRecord, c *C) {
+	c.Assert(len(x), Equals, len(y))
+	for i := 0; i < len(x); i++ {
+		c.Assert(x[i].User, Equals, y[i].User)
+		c.Assert(x[i].Host, Equals, y[i].Host)
+	}
 }

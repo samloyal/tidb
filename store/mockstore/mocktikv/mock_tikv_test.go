@@ -14,6 +14,7 @@
 package mocktikv
 
 import (
+	"math"
 	"strings"
 	"testing"
 
@@ -191,6 +192,27 @@ func (s *testMockTiKVSuite) TestGet(c *C) {
 	s.mustGetOK(c, "x", 11, "x")
 }
 
+func (s *testMockTiKVSuite) TestGetWithLock(c *C) {
+	key := "key"
+	value := "value"
+	s.mustPutOK(c, key, value, 5, 10)
+	mutations := []*kvrpcpb.Mutation{{
+		Op:  kvrpcpb.Op_Lock,
+		Key: []byte(key),
+	},
+	}
+	// test with lock's type is lock
+	s.mustPrewriteOK(c, mutations, key, 20)
+	s.mustGetOK(c, key, 25, value)
+	s.mustCommitOK(c, [][]byte{[]byte(key)}, 20, 30)
+
+	// test get with lock's max ts and primary key
+	s.mustPrewriteOK(c, putMutations(key, "value2", "key2", "v5"), key, 40)
+	s.mustGetErr(c, key, 41)
+	s.mustGetErr(c, "key2", math.MaxUint64)
+	s.mustGetOK(c, key, math.MaxUint64, "value")
+}
+
 func (s *testMockTiKVSuite) TestDelete(c *C) {
 	s.mustPutOK(c, "x", "x5-10", 5, 10)
 	s.mustDeleteOK(c, "x", 15, 20)
@@ -349,6 +371,14 @@ func (s *testMockTiKVSuite) TestScanLock(c *C) {
 	s.mustPrewriteOK(c, putMutations("p1", "v5", "s1", "v5"), "p1", 5)
 	s.mustPrewriteOK(c, putMutations("p2", "v10", "s2", "v10"), "p2", 10)
 	s.mustPrewriteOK(c, putMutations("p3", "v20", "s3", "v20"), "p3", 20)
+
+	locks, err := s.store.ScanLock([]byte("a"), []byte("r"), 12)
+	c.Assert(err, IsNil)
+	c.Assert(locks, DeepEquals, []*kvrpcpb.LockInfo{
+		lock("p1", "p1", 5),
+		lock("p2", "p2", 10),
+	})
+
 	s.mustScanLock(c, 10, []*kvrpcpb.LockInfo{
 		lock("p1", "p1", 5),
 		lock("p2", "p2", 10),

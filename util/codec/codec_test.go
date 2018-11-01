@@ -20,7 +20,8 @@ import (
 	"time"
 
 	. "github.com/pingcap/check"
-	"github.com/pingcap/tidb/mysql"
+	"github.com/pingcap/parser/mysql"
+	"github.com/pingcap/parser/terror"
 	"github.com/pingcap/tidb/sessionctx/stmtctx"
 	"github.com/pingcap/tidb/types"
 	"github.com/pingcap/tidb/types/json"
@@ -512,7 +513,7 @@ func parseTime(c *C, s string) types.Time {
 }
 
 func parseDuration(c *C, s string) types.Duration {
-	m, err := types.ParseDuration(s, types.DefaultFsp)
+	m, err := types.ParseDuration(nil, s, types.DefaultFsp)
 	c.Assert(err, IsNil)
 	return m
 }
@@ -734,12 +735,33 @@ func (s *testCodecSuite) TestDecimal(c *C) {
 		d.SetLength(20)
 		d.SetFrac(6)
 		d.SetMysqlDecimal(dec)
-		decs = append(decs, EncodeDecimal(nil, d.GetMysqlDecimal(), d.Length(), d.Frac()))
+		b, err := EncodeDecimal(nil, d.GetMysqlDecimal(), d.Length(), d.Frac())
+		c.Assert(err, IsNil)
+		decs = append(decs, b)
 	}
 	for i := 0; i < len(decs)-1; i++ {
 		cmp := bytes.Compare(decs[i], decs[i+1])
 		c.Assert(cmp, LessEqual, 0)
 	}
+
+	d := types.NewDecFromStringForTest("-123.123456789")
+	_, err := EncodeDecimal(nil, d, 20, 5)
+	c.Assert(terror.ErrorEqual(err, types.ErrTruncated), IsTrue, Commentf("err %v", err))
+	_, err = EncodeDecimal(nil, d, 12, 10)
+	c.Assert(terror.ErrorEqual(err, types.ErrOverflow), IsTrue, Commentf("err %v", err))
+
+	sc.IgnoreTruncate = true
+	decimalDatum := types.NewDatum(d)
+	decimalDatum.SetLength(20)
+	decimalDatum.SetFrac(5)
+	_, err = EncodeValue(sc, nil, decimalDatum)
+	c.Assert(err, IsNil)
+
+	sc.OverflowAsWarning = true
+	decimalDatum.SetLength(12)
+	decimalDatum.SetFrac(10)
+	_, err = EncodeValue(sc, nil, decimalDatum)
+	c.Assert(err, IsNil)
 }
 
 func (s *testCodecSuite) TestJSON(c *C) {
@@ -913,7 +935,7 @@ func (s *testCodecSuite) TestDecodeOneToChunk(c *C) {
 		datums = append(datums, types.NewDatum(t.value))
 	}
 	rowCount := 3
-	decoder := NewDecoder(chunk.NewChunk(tps), time.Local)
+	decoder := NewDecoder(chunk.New(tps, 32, 32), time.Local)
 	for rowIdx := 0; rowIdx < rowCount; rowIdx++ {
 		encoded, err := EncodeValue(sc, nil, datums...)
 		c.Assert(err, IsNil)

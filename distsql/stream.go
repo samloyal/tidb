@@ -14,7 +14,7 @@
 package distsql
 
 import (
-	"github.com/juju/errors"
+	"github.com/pingcap/parser/terror"
 	"github.com/pingcap/tidb/kv"
 	"github.com/pingcap/tidb/metrics"
 	"github.com/pingcap/tidb/sessionctx"
@@ -22,7 +22,8 @@ import (
 	"github.com/pingcap/tidb/types"
 	"github.com/pingcap/tidb/util/chunk"
 	"github.com/pingcap/tidb/util/codec"
-	tipb "github.com/pingcap/tipb/go-tipb"
+	"github.com/pingcap/tipb/go-tipb"
+	"github.com/pkg/errors"
 	"golang.org/x/net/context"
 )
 
@@ -79,8 +80,9 @@ func (r *streamResult) readDataFromResponse(ctx context.Context, resp kv.Respons
 	if stream.Error != nil {
 		return false, errors.Errorf("stream response error: [%d]%s\n", stream.Error.Code, stream.Error.Msg)
 	}
-
-	// TODO: Check stream.GetEncodeType() here if we support tipb.EncodeType_TypeArrow some day.
+	for _, warning := range stream.Warnings {
+		r.ctx.GetSessionVars().StmtCtx.AppendWarning(terror.ClassTiKV.New(terror.ErrCode(warning.Code), warning.Msg))
+	}
 
 	err = result.Unmarshal(stream.Data)
 	if err != nil {
@@ -113,7 +115,7 @@ func (r *streamResult) readDataIfNecessary(ctx context.Context) error {
 func (r *streamResult) flushToChunk(chk *chunk.Chunk) (err error) {
 	remainRowsData := r.curr.RowsData
 	maxChunkSize := r.ctx.GetSessionVars().MaxChunkSize
-	decoder := codec.NewDecoder(chk, r.ctx.GetSessionVars().GetTimeZone())
+	decoder := codec.NewDecoder(chk, r.ctx.GetSessionVars().Location())
 	for chk.NumRows() < maxChunkSize && len(remainRowsData) > 0 {
 		for i := 0; i < r.rowLen; i++ {
 			remainRowsData, err = decoder.DecodeOne(remainRowsData, i, r.fieldTypes[i])

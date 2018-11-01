@@ -15,7 +15,7 @@ package kv
 
 import (
 	. "github.com/pingcap/check"
-	"github.com/pingcap/tidb/terror"
+	"github.com/pingcap/parser/terror"
 	"github.com/pingcap/tidb/util/testleak"
 )
 
@@ -119,7 +119,7 @@ func (s *testUnionStoreSuite) TestLazyConditionCheck(c *C) {
 	s.us.SetOption(PresumeKeyNotExists, nil)
 	s.us.SetOption(PresumeKeyNotExistsError, ErrNotExist)
 	_, err = s.us.Get([]byte("2"))
-	c.Assert(terror.ErrorEqual(err, ErrNotExist), IsTrue)
+	c.Assert(terror.ErrorEqual(err, ErrNotExist), IsTrue, Commentf("err %v", err))
 
 	err = s.us.CheckLazyConditionPairs()
 	c.Assert(err, NotNil)

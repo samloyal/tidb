@@ -14,8 +14,9 @@
 package types
 
 import (
-	"github.com/pingcap/tidb/mysql"
-	"github.com/pingcap/tidb/terror"
+	"github.com/pingcap/parser/mysql"
+	"github.com/pingcap/parser/terror"
+	parser_types "github.com/pingcap/parser/types"
 )
 
 var (
@@ -45,14 +46,17 @@ var (
 	ErrWrongFieldSpec = terror.ClassTypes.New(codeWrongFieldSpec, "Wrong Field Spec")
 	// ErrBadNumber is return when parsing an invalid binary decimal number.
 	ErrBadNumber = terror.ClassTypes.New(codeBadNumber, "Bad Number")
+	// ErrInvalidDefault is returned when meet a invalid default value.
+	ErrInvalidDefault = parser_types.ErrInvalidDefault
 	// ErrCastAsSignedOverflow is returned when positive out-of-range integer, and convert to it's negative complement.
 	ErrCastAsSignedOverflow = terror.ClassTypes.New(codeUnknown, msgCastAsSignedOverflow)
 	// ErrCastNegIntAsUnsigned is returned when a negative integer be casted to an unsigned int.
 	ErrCastNegIntAsUnsigned = terror.ClassTypes.New(codeUnknown, msgCastNegIntAsUnsigned)
-	// ErrInvalidDefault is returned when meet a invalid default value.
-	ErrInvalidDefault = terror.ClassTypes.New(codeInvalidDefault, "Invalid default value for '%s'")
 	// ErrMBiggerThanD is returned when precision less than the scale.
 	ErrMBiggerThanD = terror.ClassTypes.New(codeMBiggerThanD, mysql.MySQLErrName[mysql.ErrMBiggerThanD])
+	// ErrWarnDataOutOfRange is returned when the value in a numeric column that is outside the permissible range of the column data type.
+	// See https://dev.mysql.com/doc/refman/5.5/en/out-of-range-and-overflow.html for details
+	ErrWarnDataOutOfRange = terror.ClassTypes.New(codeDataOutOfRange, mysql.MySQLErrName[mysql.ErrWarnDataOutOfRange])
 )
 
 const (
@@ -73,6 +77,7 @@ const (
 	codeUnknown             = terror.ErrCode(mysql.ErrUnknown)
 	codeInvalidDefault      = terror.ErrCode(mysql.ErrInvalidDefault)
 	codeMBiggerThanD        = terror.ErrCode(mysql.ErrMBiggerThanD)
+	codeDataOutOfRange      = terror.ErrCode(mysql.ErrWarnDataOutOfRange)
 )
 
 var (
@@ -99,6 +104,7 @@ func init() {
 		codeUnknown:             mysql.ErrUnknown,
 		codeInvalidDefault:      mysql.ErrInvalidDefault,
 		codeMBiggerThanD:        mysql.ErrMBiggerThanD,
+		codeDataOutOfRange:      mysql.ErrWarnDataOutOfRange,
 	}
 	terror.ErrClassToMySQLCodes[terror.ClassTypes] = typesMySQLErrCodes
 }

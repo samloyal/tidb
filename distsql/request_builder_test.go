@@ -24,11 +24,12 @@ import (
 	"github.com/pingcap/tidb/sessionctx/variable"
 	"github.com/pingcap/tidb/tablecodec"
 	"github.com/pingcap/tidb/types"
+	"github.com/pingcap/tidb/util/codec"
 	"github.com/pingcap/tidb/util/logutil"
 	"github.com/pingcap/tidb/util/mock"
 	"github.com/pingcap/tidb/util/ranger"
 	"github.com/pingcap/tidb/util/testleak"
-	tipb "github.com/pingcap/tipb/go-tipb"
+	"github.com/pingcap/tipb/go-tipb"
 )
 
 var _ = Suite(&testSuite{})
@@ -82,22 +83,26 @@ type handleRange struct {
 func (s *testSuite) getExpectedRanges(tid int64, hrs []*handleRange) []kv.KeyRange {
 	krs := make([]kv.KeyRange, 0, len(hrs))
 	for _, hr := range hrs {
-		startKey := tablecodec.EncodeRowKeyWithHandle(tid, hr.start)
-		endKey := tablecodec.EncodeRowKeyWithHandle(tid, hr.end)
+		low := codec.EncodeInt(nil, hr.start)
+		high := codec.EncodeInt(nil, hr.end)
+		high = []byte(kv.Key(high).PrefixNext())
+		startKey := tablecodec.EncodeRowKey(tid, low)
+		endKey := tablecodec.EncodeRowKey(tid, high)
 		krs = append(krs, kv.KeyRange{StartKey: startKey, EndKey: endKey})
 	}
 	return krs
 }
 
 func (s *testSuite) TestTableHandlesToKVRanges(c *C) {
-	handles := []int64{0, 2, 3, 4, 5, 10, 11, 100}
+	handles := []int64{0, 2, 3, 4, 5, 10, 11, 100, 9223372036854775806, 9223372036854775807}
 
 	// Build expected key ranges.
 	hrs := make([]*handleRange, 0, len(handles))
-	hrs = append(hrs, &handleRange{start: 0, end: 1})
-	hrs = append(hrs, &handleRange{start: 2, end: 6})
-	hrs = append(hrs, &handleRange{start: 10, end: 12})
-	hrs = append(hrs, &handleRange{start: 100, end: 101})
+	hrs = append(hrs, &handleRange{start: 0, end: 0})
+	hrs = append(hrs, &handleRange{start: 2, end: 5})
+	hrs = append(hrs, &handleRange{start: 10, end: 11})
+	hrs = append(hrs, &handleRange{start: 100, end: 100})
+	hrs = append(hrs, &handleRange{start: 9223372036854775806, end: 9223372036854775807})
 
 	// Build key ranges.
 	expect := s.getExpectedRanges(1, hrs)
@@ -112,7 +117,7 @@ func (s *testSuite) TestTableHandlesToKVRanges(c *C) {
 }
 
 func (s *testSuite) TestTableRangesToKVRanges(c *C) {
-	ranges := []*ranger.NewRange{
+	ranges := []*ranger.Range{
 		{
 			LowVal:  []types.Datum{types.NewIntDatum(1)},
 			HighVal: []types.Datum{types.NewIntDatum(2)},
@@ -169,7 +174,7 @@ func (s *testSuite) TestTableRangesToKVRanges(c *C) {
 }
 
 func (s *testSuite) TestIndexRangesToKVRanges(c *C) {
-	ranges := []*ranger.NewRange{
+	ranges := []*ranger.Range{
 		{
 			LowVal:  []types.Datum{types.NewIntDatum(1)},
 			HighVal: []types.Datum{types.NewIntDatum(2)},
@@ -228,7 +233,7 @@ func (s *testSuite) TestIndexRangesToKVRanges(c *C) {
 }
 
 func (s *testSuite) TestRequestBuilder1(c *C) {
-	ranges := []*ranger.NewRange{
+	ranges := []*ranger.Range{
 		{
 			LowVal:  []types.Datum{types.NewIntDatum(1)},
 			HighVal: []types.Datum{types.NewIntDatum(2)},
@@ -260,14 +265,13 @@ func (s *testSuite) TestRequestBuilder1(c *C) {
 		SetDAGRequest(&tipb.DAGRequest{}).
 		SetDesc(false).
 		SetKeepOrder(false).
-		SetPriority(kv.PriorityNormal).
 		SetFromSessionVars(variable.NewSessionVars()).
 		Build()
 	c.Assert(err, IsNil)
 	expect := &kv.Request{
 		Tp:      103,
 		StartTs: 0x0,
-		Data:    []uint8{0x8, 0x0, 0x18, 0x0, 0x20, 0x0},
+		Data:    []uint8{0x8, 0x0, 0x18, 0x0, 0x20, 0x0, 0x40, 0x0, 0x5a, 0x0},
 		KeyRanges: []kv.KeyRange{
 			{
 				StartKey: kv.Key{0x74, 0x80, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0xc, 0x5f, 0x72, 0x80, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x1},
@@ -303,7 +307,7 @@ func (s *testSuite) TestRequestBuilder1(c *C) {
 }
 
 func (s *testSuite) TestRequestBuilder2(c *C) {
-	ranges := []*ranger.NewRange{
+	ranges := []*ranger.Range{
 		{
 			LowVal:  []types.Datum{types.NewIntDatum(1)},
 			HighVal: []types.Datum{types.NewIntDatum(2)},
@@ -335,14 +339,13 @@ func (s *testSuite) TestRequestBuilder2(c *C) {
 		SetDAGRequest(&tipb.DAGRequest{}).
 		SetDesc(false).
 		SetKeepOrder(false).
-		SetPriority(kv.PriorityNormal).
 		SetFromSessionVars(variable.NewSessionVars()).
 		Build()
 	c.Assert(err, IsNil)
 	expect := &kv.Request{
 		Tp:      103,
 		StartTs: 0x0,
-		Data:    []uint8{0x8, 0x0, 0x18, 0x0, 0x20, 0x0},
+		Data:    []uint8{0x8, 0x0, 0x18, 0x0, 0x20, 0x0, 0x40, 0x0, 0x5a, 0x0},
 		KeyRanges: []kv.KeyRange{
 			{
 				StartKey: kv.Key{0x74, 0x80, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0xc, 0x5f, 0x69, 0x80, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0xf, 0x3, 0x80, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x1},
@@ -384,14 +387,13 @@ func (s *testSuite) TestRequestBuilder3(c *C) {
 		SetDAGRequest(&tipb.DAGRequest{}).
 		SetDesc(false).
 		SetKeepOrder(false).
-		SetPriority(kv.PriorityNormal).
 		SetFromSessionVars(variable.NewSessionVars()).
 		Build()
 	c.Assert(err, IsNil)
 	expect := &kv.Request{
 		Tp:      103,
 		StartTs: 0x0,
-		Data:    []uint8{0x8, 0x0, 0x18, 0x0, 0x20, 0x0},
+		Data:    []uint8{0x8, 0x0, 0x18, 0x0, 0x20, 0x0, 0x40, 0x0, 0x5a, 0x0},
 		KeyRanges: []kv.KeyRange{
 			{
 				StartKey: kv.Key{0x74, 0x80, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0xf, 0x5f, 0x72, 0x80, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0},
@@ -446,7 +448,6 @@ func (s *testSuite) TestRequestBuilder4(c *C) {
 		SetDAGRequest(&tipb.DAGRequest{}).
 		SetDesc(false).
 		SetKeepOrder(false).
-		SetPriority(kv.PriorityNormal).
 		SetStreaming(true).
 		SetFromSessionVars(variable.NewSessionVars()).
 		Build()
@@ -454,7 +455,7 @@ func (s *testSuite) TestRequestBuilder4(c *C) {
 	expect := &kv.Request{
 		Tp:             103,
 		StartTs:        0x0,
-		Data:           []uint8{0x8, 0x0, 0x18, 0x0, 0x20, 0x0},
+		Data:           []uint8{0x8, 0x0, 0x18, 0x0, 0x20, 0x0, 0x40, 0x0, 0x5a, 0x0},
 		KeyRanges:      keyRanges,
 		KeepOrder:      false,
 		Desc:           false,
@@ -491,7 +492,7 @@ func (s *testSuite) TestRequestBuilder5(c *C) {
 	actual, err := (&RequestBuilder{}).SetKeyRanges(keyRanges).
 		SetAnalyzeRequest(&tipb.AnalyzeReq{}).
 		SetKeepOrder(true).
-		SetPriority(kv.PriorityLow).
+		SetConcurrency(15).
 		Build()
 	c.Assert(err, IsNil)
 	expect := &kv.Request{
@@ -501,8 +502,8 @@ func (s *testSuite) TestRequestBuilder5(c *C) {
 		KeyRanges:      keyRanges,
 		KeepOrder:      true,
 		Desc:           false,
-		Concurrency:    0,
-		IsolationLevel: 0,
+		Concurrency:    15,
+		IsolationLevel: kv.RC,
 		Priority:       1,
 		NotFillCache:   true,
 		SyncLog:        false,

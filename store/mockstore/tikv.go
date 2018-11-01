@@ -17,11 +17,12 @@ import (
 	"net/url"
 	"strings"
 
-	"github.com/juju/errors"
-	"github.com/pingcap/pd/pd-client"
+	"github.com/pingcap/pd/client"
+	"github.com/pingcap/tidb/config"
 	"github.com/pingcap/tidb/kv"
 	"github.com/pingcap/tidb/store/mockstore/mocktikv"
 	"github.com/pingcap/tidb/store/tikv"
+	"github.com/pkg/errors"
 )
 
 // MockDriver is in memory mock TiKV driver.
@@ -37,15 +38,22 @@ func (d MockDriver) Open(path string) (kv.Storage, error) {
 	if !strings.EqualFold(u.Scheme, "mocktikv") {
 		return nil, errors.Errorf("Uri scheme expected(mocktikv) but found (%s)", u.Scheme)
 	}
-	return NewMockTikvStore(WithPath(u.Path))
+
+	opts := []MockTiKVStoreOption{WithPath(u.Path)}
+	txnLocalLatches := config.GetGlobalConfig().TxnLocalLatches
+	if txnLocalLatches.Enabled {
+		opts = append(opts, WithTxnLocalLatches(txnLocalLatches.Capacity))
+	}
+	return NewMockTikvStore(opts...)
 }
 
 type mockOptions struct {
-	cluster        *mocktikv.Cluster
-	mvccStore      mocktikv.MVCCStore
-	clientHijack   func(tikv.Client) tikv.Client
-	pdClientHijack func(pd.Client) pd.Client
-	path           string
+	cluster         *mocktikv.Cluster
+	mvccStore       mocktikv.MVCCStore
+	clientHijack    func(tikv.Client) tikv.Client
+	pdClientHijack  func(pd.Client) pd.Client
+	path            string
+	txnLocalLatches uint
 }
 
 // MockTiKVStoreOption is used to control some behavior of mock tikv.
@@ -80,6 +88,13 @@ func WithPath(path string) MockTiKVStoreOption {
 	}
 }
 
+// WithTxnLocalLatches enable txnLocalLatches, when capacity > 0.
+func WithTxnLocalLatches(capacity uint) MockTiKVStoreOption {
+	return func(c *mockOptions) {
+		c.txnLocalLatches = capacity
+	}
+}
+
 // NewMockTikvStore creates a mocked tikv store, the path is the file path to store the data.
 // If path is an empty string, a memory storage will be created.
 func NewMockTikvStore(options ...MockTiKVStoreOption) (kv.Storage, error) {
@@ -88,10 +103,10 @@ func NewMockTikvStore(options ...MockTiKVStoreOption) (kv.Storage, error) {
 		f(&opt)
 	}
 
-	client, pdClient, err := mocktikv.NewTestClient(opt.cluster, opt.mvccStore, opt.path)
+	client, pdClient, err := mocktikv.NewTiKVAndPDClient(opt.cluster, opt.mvccStore, opt.path)
 	if err != nil {
 		return nil, errors.Trace(err)
 	}
 
-	return tikv.NewTestTiKVStore(client, pdClient, opt.clientHijack, opt.pdClientHijack)
+	return tikv.NewTestTiKVStore(client, pdClient, opt.clientHijack, opt.pdClientHijack, opt.txnLocalLatches)
 }

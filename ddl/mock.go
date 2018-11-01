@@ -18,10 +18,10 @@ import (
 	"time"
 
 	"github.com/coreos/etcd/clientv3"
-	"github.com/juju/errors"
-	"github.com/pingcap/tidb/ast"
-	"github.com/pingcap/tidb/model"
+	"github.com/pingcap/parser/ast"
+	"github.com/pingcap/parser/model"
 	"github.com/pingcap/tidb/sessionctx"
+	"github.com/pkg/errors"
 	"golang.org/x/net/context"
 )
 
@@ -49,6 +49,9 @@ func (s *mockSchemaSyncer) Init(ctx context.Context) error {
 func (s *mockSchemaSyncer) GlobalVersionCh() clientv3.WatchChan {
 	return s.globalVerCh
 }
+
+// WatchGlobalSchemaVer implements SchemaSyncer.WatchGlobalSchemaVer interface.
+func (s *mockSchemaSyncer) WatchGlobalSchemaVer(context.Context) {}
 
 // UpdateSelfVersion implements SchemaSyncer.UpdateSelfVersion interface.
 func (s *mockSchemaSyncer) UpdateSelfVersion(ctx context.Context, version int64) error {

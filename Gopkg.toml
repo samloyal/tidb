@@ -1,4 +1,5 @@
 ignored = ["github.com/coreos/etcd/etcdserver", "github.com/coreos/etcd/mvcc", "github.com/coreos/etcd/auth"]
+required = ["github.com/golang/protobuf/jsonpb"]
 
 [prune]
   non-go = true
@@ -13,24 +14,19 @@ ignored = ["github.com/coreos/etcd/etcdserver", "github.com/coreos/etcd/mvcc", "
   branch = "master"
   name = "github.com/blacktear23/go-proxyprotocol"
 
-# lock etcd version at 3.2.14
+# lock etcd version at 3.2.18
 [[constraint]]
   name = "github.com/coreos/etcd"
-  version = "=3.2.14"
+  version = "=3.2.18"
 
-# lock grpc version at 1.7.5 becuase etcd depdens on this version
 [[constraint]]
   name = "google.golang.org/grpc"
   source = "https://github.com/grpc/grpc-go.git"
-  version = "=1.7.5"
+  version = "=1.12.2"
 
 [[constraint]]
-  branch = "master"
-  name = "github.com/coreos/gofail"
-
-[[constraint]]
-  branch = "master"
-  name = "github.com/cznic/parser"
+  version = "1.1.0"
+  name = "github.com/golang/protobuf"
 
 [[constraint]]
   branch = "master"
@@ -69,5 +65,44 @@ ignored = ["github.com/coreos/etcd/etcdserver", "github.com/coreos/etcd/mvcc", "
   version = "2.8.0"
 
 [[constraint]]
+  name = "github.com/pingcap/pd"
+  branch = "master"
+
+[[constraint]]
+  name = "github.com/pingcap/kvproto"
+  branch = "master"
+	
+[[constraint]]
   name = "gopkg.in/natefinch/lumberjack.v2"
   version = "2.0.0"
+
+[[constraint]]
+  name = "github.com/sirupsen/logrus"
+  revision = "3bcb09397d6d88e7676a9bc8433ca11ba5304837"
+
+
+[[constraint]]
+  name = "github.com/opentracing/basictracer-go"
+  version = "1.0.0"
+
+[[constraint]]
+  branch = "master"
+  name = "github.com/etcd-io/gofail"
+
+[[constraint]]
+  branch = "master"
+  name = "github.com/pingcap/tipb"
+
+[[constraint]]
+  name = "github.com/pkg/errors"
+  version = "0.11.0"
+  source = "https://github.com/pingcap/errors.git"
+
+[[constraint]]
+  branch = "master"
+  name = "github.com/pingcap/parser"
+
+
+[[constraint]]
+  name = "github.com/pingcap/tidb-tools"
+  revision = "5db58e3b7e6613456551c40d011806a346b2f44a"

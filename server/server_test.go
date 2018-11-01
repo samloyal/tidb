@@ -27,8 +27,8 @@ import (
 
 	"github.com/go-sql-driver/mysql"
 	. "github.com/pingcap/check"
+	tmysql "github.com/pingcap/parser/mysql"
 	"github.com/pingcap/tidb/kv"
-	tmysql "github.com/pingcap/tidb/mysql"
 	"github.com/pingcap/tidb/util/logutil"
 	"github.com/pingcap/tidb/util/printer"
 	log "github.com/sirupsen/logrus"
@@ -121,6 +121,24 @@ func (dbt *DBTest) fail(method, query string, err error) {
 		query = "[query too large to print]"
 	}
 	dbt.Fatalf("Error on %s %s: %s", method, query, err.Error())
+}
+
+func (dbt *DBTest) mustPrepare(query string) *sql.Stmt {
+	stmt, err := dbt.db.Prepare(query)
+	dbt.Assert(err, IsNil, Commentf("Prepare %s", query))
+	return stmt
+}
+
+func (dbt *DBTest) mustExecPrepared(stmt *sql.Stmt, args ...interface{}) sql.Result {
+	res, err := stmt.Exec(args...)
+	dbt.Assert(err, IsNil, Commentf("Execute prepared with args: %s", args))
+	return res
+}
+
+func (dbt *DBTest) mustQueryPrepared(stmt *sql.Stmt, args ...interface{}) *sql.Rows {
+	rows, err := stmt.Query(args...)
+	dbt.Assert(err, IsNil, Commentf("Query prepared with args: %s", args))
+	return rows
 }
 
 func (dbt *DBTest) mustExec(query string, args ...interface{}) (res sql.Result) {
@@ -302,6 +320,30 @@ func runTestPreparedString(t *C) {
 	})
 }
 
+// runTestPreparedTimestamp does not really cover binary timestamp format, because MySQL driver in golang
+// does not use this format. MySQL driver in golang will convert the timestamp to a string.
+// This case guarantees it could work.
+func runTestPreparedTimestamp(t *C) {
+	runTestsOnNewDB(t, nil, "prepared_timestamp", func(dbt *DBTest) {
+		dbt.mustExec("create table test (a timestamp, b time)")
+		dbt.mustExec("set time_zone='+00:00'")
+		insertStmt := dbt.mustPrepare("insert test values (?, ?)")
+		defer insertStmt.Close()
+		vts := time.Unix(1, 1)
+		vt := time.Unix(-1, 1)
+		dbt.mustExecPrepared(insertStmt, vts, vt)
+		selectStmt := dbt.mustPrepare("select * from test where a = ? and b = ?")
+		defer selectStmt.Close()
+		rows := dbt.mustQueryPrepared(selectStmt, vts, vt)
+		t.Assert(rows.Next(), IsTrue)
+		var outA, outB string
+		err := rows.Scan(&outA, &outB)
+		t.Assert(err, IsNil)
+		t.Assert(outA, Equals, "1970-01-01 00:00:01")
+		t.Assert(outB, Equals, "23:59:59")
+	})
+}
+
 func runTestLoadData(c *C, server *Server) {
 	// create a file and write data.
 	path := "/tmp/load_data_test.csv"
@@ -383,7 +425,7 @@ func runTestLoadData(c *C, server *Server) {
 		dbt.Assert(err, IsNil)
 		lastID, err = rs.LastInsertId()
 		dbt.Assert(err, IsNil)
-		dbt.Assert(lastID, Equals, int64(6))
+		dbt.Assert(lastID, Equals, int64(7))
 		affectedRows, err = rs.RowsAffected()
 		dbt.Assert(err, IsNil)
 		dbt.Assert(affectedRows, Equals, int64(4))
@@ -422,7 +464,7 @@ func runTestLoadData(c *C, server *Server) {
 		dbt.Assert(err, IsNil)
 		lastID, err = rs.LastInsertId()
 		dbt.Assert(err, IsNil)
-		dbt.Assert(lastID, Equals, int64(10))
+		dbt.Assert(lastID, Equals, int64(11))
 		affectedRows, err = rs.RowsAffected()
 		dbt.Assert(err, IsNil)
 		dbt.Assert(affectedRows, Equals, int64(799))
@@ -495,21 +537,22 @@ func runTestErrorCode(c *C) {
 		_, err = txn2.Exec("select * from tbl_not_exists;")
 		checkErrorCode(c, err, tmysql.ErrNoSuchTable)
 		_, err = txn2.Exec("create database test;")
-		checkErrorCode(c, err, tmysql.ErrDBCreateExists)
+		// Make tests stable. Some times the error may be the ErrInfoSchemaChanged.
+		checkErrorCode(c, err, tmysql.ErrDBCreateExists, tmysql.ErrUnknown)
 		_, err = txn2.Exec("create database aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa;")
-		checkErrorCode(c, err, tmysql.ErrTooLongIdent)
+		checkErrorCode(c, err, tmysql.ErrTooLongIdent, tmysql.ErrUnknown)
 		_, err = txn2.Exec("create table test (c int);")
-		checkErrorCode(c, err, tmysql.ErrTableExists)
+		checkErrorCode(c, err, tmysql.ErrTableExists, tmysql.ErrUnknown)
 		_, err = txn2.Exec("drop table unknown_table;")
-		checkErrorCode(c, err, tmysql.ErrBadTable)
+		checkErrorCode(c, err, tmysql.ErrBadTable, tmysql.ErrUnknown)
 		_, err = txn2.Exec("drop database unknown_db;")
-		checkErrorCode(c, err, tmysql.ErrDBDropExists)
+		checkErrorCode(c, err, tmysql.ErrDBDropExists, tmysql.ErrUnknown)
 		_, err = txn2.Exec("create table aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa (a int);")
-		checkErrorCode(c, err, tmysql.ErrTooLongIdent)
+		checkErrorCode(c, err, tmysql.ErrTooLongIdent, tmysql.ErrUnknown)
 		_, err = txn2.Exec("create table long_column_table (aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa int);")
-		checkErrorCode(c, err, tmysql.ErrTooLongIdent)
+		checkErrorCode(c, err, tmysql.ErrTooLongIdent, tmysql.ErrUnknown)
 		_, err = txn2.Exec("alter table test add aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa int;")
-		checkErrorCode(c, err, tmysql.ErrTooLongIdent)
+		checkErrorCode(c, err, tmysql.ErrTooLongIdent, tmysql.ErrUnknown)
 
 		// Optimizer errors
 		_, err = txn2.Exec("select *, * from test;")
@@ -531,10 +574,43 @@ func runTestErrorCode(c *C) {
 	})
 }
 
-func checkErrorCode(c *C, e error, code uint16) {
+func checkErrorCode(c *C, e error, codes ...uint16) {
 	me, ok := e.(*mysql.MySQLError)
 	c.Assert(ok, IsTrue, Commentf("err: %v", e))
-	c.Assert(me.Number, Equals, code)
+	if len(codes) == 1 {
+		c.Assert(me.Number, Equals, codes[0])
+	}
+	isMatchCode := false
+	for _, code := range codes {
+		if me.Number == code {
+			isMatchCode = true
+			break
+		}
+	}
+	c.Assert(isMatchCode, IsTrue, Commentf("got err %v, expected err codes %v", me, codes))
+}
+
+func runTestShowProcessList(c *C) {
+	runTests(c, nil, func(dbt *DBTest) {
+		fullSQL := "show                                                                                        full processlist"
+		simpSQL := "show                                                                                        processlist"
+		rows := dbt.mustQuery(fullSQL)
+		c.Assert(rows.Next(), IsTrue)
+		var outA, outB, outC, outD, outE, outF, outG, outH, outI string
+		err := rows.Scan(&outA, &outB, &outC, &outD, &outE, &outF, &outG, &outH, &outI)
+		c.Assert(err, IsNil)
+		c.Assert(outE, Equals, "Query")
+		c.Assert(outF, Equals, "0")
+		c.Assert(outG, Equals, "2")
+		c.Assert(outH, Equals, fullSQL)
+		rows = dbt.mustQuery(simpSQL)
+		err = rows.Scan(&outA, &outB, &outC, &outD, &outE, &outF, &outG, &outH, &outI)
+		c.Assert(err, IsNil)
+		c.Assert(outE, Equals, "Query")
+		c.Assert(outF, Equals, "0")
+		c.Assert(outG, Equals, "2")
+		c.Assert(outH, Equals, simpSQL[:100])
+	})
 }
 
 func runTestAuth(c *C) {
@@ -553,6 +629,7 @@ func runTestAuth(c *C) {
 		config.User = "authtest"
 		config.Passwd = "456"
 	}))
+	c.Assert(err, IsNil)
 	_, err = db.Query("USE mysql;")
 	c.Assert(err, NotNil, Commentf("Wrong password should be failed"))
 	db.Close()

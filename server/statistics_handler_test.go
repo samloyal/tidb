@@ -21,54 +21,36 @@ import (
 	"os"
 
 	"github.com/go-sql-driver/mysql"
+	"github.com/gorilla/mux"
 	. "github.com/pingcap/check"
 	"github.com/pingcap/tidb/config"
+	"github.com/pingcap/tidb/domain"
+	"github.com/pingcap/tidb/kv"
 	"github.com/pingcap/tidb/session"
+	"github.com/pingcap/tidb/statistics"
 	"github.com/pingcap/tidb/store/mockstore"
 	"github.com/pingcap/tidb/store/mockstore/mocktikv"
 )
 
 type testDumpStatsSuite struct {
 	server *Server
+	sh     *StatsHandler
+	store  kv.Storage
+	domain *domain.Domain
 }
 
 var _ = Suite(new(testDumpStatsSuite))
 
-func (ds *testDumpStatsSuite) TestDumpStatsAPI(c *C) {
-	ds.startServer(c)
-	ds.prepareData(c)
-	defer ds.stopServer(c)
-
-	resp, err := http.Get("http://127.0.0.1:10090/stats/dump/tidb/test")
-	c.Assert(err, IsNil)
-
-	path := "/tmp/stats.json"
-	fp, err := os.Create(path)
-	c.Assert(err, IsNil)
-	c.Assert(fp, NotNil)
-
-	defer func() {
-		err = fp.Close()
-		c.Assert(err, IsNil)
-		err = os.Remove(path)
-		c.Assert(err, IsNil)
-	}()
-
-	js, err := ioutil.ReadAll(resp.Body)
-	c.Assert(err, IsNil)
-	fp.Write(js)
-	ds.checkData(c, path)
-}
-
 func (ds *testDumpStatsSuite) startServer(c *C) {
 	mvccStore := mocktikv.MustNewMVCCStore()
-	store, err := mockstore.NewMockTikvStore(mockstore.WithMVCCStore(mvccStore))
+	var err error
+	ds.store, err = mockstore.NewMockTikvStore(mockstore.WithMVCCStore(mvccStore))
 	c.Assert(err, IsNil)
-
-	_, err = session.BootstrapSession(store)
+	session.SetStatsLease(0)
+	ds.domain, err = session.BootstrapSession(ds.store)
 	c.Assert(err, IsNil)
-
-	tidbdrv := NewTiDBDriver(store)
+	ds.domain.SetStatsUpdating(true)
+	tidbdrv := NewTiDBDriver(ds.store)
 
 	cfg := config.NewConfig()
 	cfg.Port = 4001
@@ -77,16 +59,52 @@ func (ds *testDumpStatsSuite) startServer(c *C) {
 
 	server, err := NewServer(cfg, tidbdrv)
 	c.Assert(err, IsNil)
-
 	ds.server = server
 	go server.Run()
 	waitUntilServerOnline(cfg.Status.StatusPort)
+
+	do, err := session.GetDomain(ds.store)
+	c.Assert(err, IsNil)
+	ds.sh = &StatsHandler{do}
 }
 
 func (ds *testDumpStatsSuite) stopServer(c *C) {
+	if ds.domain != nil {
+		ds.domain.Close()
+	}
+	if ds.store != nil {
+		ds.store.Close()
+	}
 	if ds.server != nil {
 		ds.server.Close()
 	}
+}
+
+func (ds *testDumpStatsSuite) TestDumpStatsAPI(c *C) {
+	ds.startServer(c)
+	ds.prepareData(c)
+	defer ds.server.Close()
+
+	router := mux.NewRouter()
+	router.Handle("/stats/dump/{db}/{table}", ds.sh)
+
+	resp, err := http.Get("http://127.0.0.1:10090/stats/dump/tidb/test")
+	c.Assert(err, IsNil)
+	defer resp.Body.Close()
+
+	path := "/tmp/stats.json"
+	fp, err := os.Create(path)
+	c.Assert(err, IsNil)
+	c.Assert(fp, NotNil)
+	defer func() {
+		c.Assert(fp.Close(), IsNil)
+		c.Assert(os.Remove(path), IsNil)
+	}()
+
+	js, err := ioutil.ReadAll(resp.Body)
+	c.Assert(err, IsNil)
+	fp.Write(js)
+	ds.checkData(c, path)
 }
 
 func (ds *testDumpStatsSuite) prepareData(c *C) {
@@ -95,12 +113,19 @@ func (ds *testDumpStatsSuite) prepareData(c *C) {
 	defer db.Close()
 	dbt := &DBTest{c, db}
 
+	h := ds.sh.do.StatsHandle()
 	dbt.mustExec("create database tidb")
 	dbt.mustExec("use tidb")
 	dbt.mustExec("create table test (a int, b varchar(20))")
+	h.HandleDDLEvent(<-h.DDLEventCh())
 	dbt.mustExec("create index c on test (a, b)")
-	dbt.mustExec("insert test values (1, 2)")
+	dbt.mustExec("insert test values (1, 's')")
+	c.Assert(h.DumpStatsDeltaToKV(statistics.DumpAll), IsNil)
 	dbt.mustExec("analyze table test")
+	dbt.mustExec("insert into test(a,b) values (1, 'v'),(3, 'vvv'),(5, 'vv')")
+	is := ds.sh.do.InfoSchema()
+	c.Assert(h.DumpStatsDeltaToKV(statistics.DumpAll), IsNil)
+	c.Assert(h.Update(is), IsNil)
 }
 
 func (ds *testDumpStatsSuite) checkData(c *C, path string) {
@@ -109,19 +134,29 @@ func (ds *testDumpStatsSuite) checkData(c *C, path string) {
 		config.Strict = false
 	}))
 	c.Assert(err, IsNil, Commentf("Error connecting"))
-	defer db.Close()
 	dbt := &DBTest{c, db}
+	defer func() {
+		dbt.mustExec("drop database tidb")
+		dbt.mustExec("truncate table mysql.stats_meta")
+		dbt.mustExec("truncate table mysql.stats_histograms")
+		dbt.mustExec("truncate table mysql.stats_buckets")
+		db.Close()
+	}()
+
 	dbt.mustExec("use tidb")
 	dbt.mustExec("drop stats test")
 	_, err = dbt.db.Exec(fmt.Sprintf("load stats '%s'", path))
 	c.Assert(err, IsNil)
 
-	rows := dbt.mustQuery("show stats_histograms")
+	rows := dbt.mustQuery("show stats_meta")
 	dbt.Check(rows.Next(), IsTrue, Commentf("unexpected data"))
 	var dbName, tableName string
+	var modifyCount, count int64
 	var other interface{}
-	err = rows.Scan(&dbName, &tableName, &other, &other, &other, &other, &other, &other)
+	err = rows.Scan(&dbName, &tableName, &other, &other, &modifyCount, &count)
 	dbt.Check(err, IsNil)
 	dbt.Check(dbName, Equals, "tidb")
 	dbt.Check(tableName, Equals, "test")
+	dbt.Check(modifyCount, Equals, int64(3))
+	dbt.Check(count, Equals, int64(4))
 }

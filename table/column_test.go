@@ -17,11 +17,11 @@ import (
 	"testing"
 
 	. "github.com/pingcap/check"
-	"github.com/pingcap/tidb/model"
-	"github.com/pingcap/tidb/mysql"
+	"github.com/pingcap/parser/charset"
+	"github.com/pingcap/parser/model"
+	"github.com/pingcap/parser/mysql"
 	"github.com/pingcap/tidb/sessionctx/stmtctx"
 	"github.com/pingcap/tidb/types"
-	"github.com/pingcap/tidb/util/charset"
 	"github.com/pingcap/tidb/util/mock"
 	"github.com/pingcap/tidb/util/testleak"
 )
@@ -43,7 +43,7 @@ func (t *testTableSuite) TestString(c *C) {
 	col.Collate = mysql.DefaultCollationName
 	col.Flag |= mysql.ZerofillFlag | mysql.UnsignedFlag | mysql.BinaryFlag | mysql.AutoIncrementFlag | mysql.NotNullFlag
 
-	c.Assert(col.GetTypeDesc(), Equals, "tinyint(2) UNSIGNED")
+	c.Assert(col.GetTypeDesc(), Equals, "tinyint(2) UNSIGNED ZEROFILL")
 	col.ToInfo()
 	tbInfo := &model.TableInfo{}
 	c.Assert(col.IsPKHandleColumn(tbInfo), Equals, false)
@@ -235,10 +235,12 @@ func (t *testTableSuite) TestCastValue(c *C) {
 		State:     model.StatePublic,
 	})
 
-	err = CastValues(ctx, []types.Datum{types.NewDatum("test")}, []*Column{col}, false)
+	err = CastValues(ctx, []types.Datum{types.NewDatum("test")}, []*Column{col})
 	c.Assert(err, NotNil)
-	err = CastValues(ctx, []types.Datum{types.NewDatum("test")}, []*Column{col}, true)
+	ctx.GetSessionVars().StmtCtx.DupKeyAsWarning = true
+	err = CastValues(ctx, []types.Datum{types.NewDatum("test")}, []*Column{col})
 	c.Assert(err, IsNil)
+	ctx.GetSessionVars().StmtCtx.DupKeyAsWarning = false
 
 	colInfoS := model.ColumnInfo{
 		FieldType: *types.NewFieldType(mysql.TypeString),
@@ -336,13 +338,13 @@ func (t *testTableSuite) TestGetDefaultValue(c *C) {
 				},
 			},
 			true,
-			types.Datum{},
+			types.NewIntDatum(0),
 			nil,
 		},
 	}
 
 	for _, tt := range tests {
-		ctx.GetSessionVars().StrictSQLMode = tt.strict
+		ctx.GetSessionVars().StmtCtx.BadNullAsWarning = !tt.strict
 		val, err := GetColDefaultValue(ctx, tt.colInfo)
 		if err != nil {
 			c.Assert(tt.err, NotNil, Commentf("%v", err))
@@ -352,7 +354,7 @@ func (t *testTableSuite) TestGetDefaultValue(c *C) {
 	}
 
 	for _, tt := range tests {
-		ctx.GetSessionVars().StrictSQLMode = tt.strict
+		ctx.GetSessionVars().StmtCtx.BadNullAsWarning = !tt.strict
 		val, err := GetColOriginDefaultValue(ctx, tt.colInfo)
 		if err != nil {
 			c.Assert(tt.err, NotNil, Commentf("%v", err))

@@ -19,9 +19,9 @@ import (
 	"strings"
 
 	. "github.com/pingcap/check"
-	"github.com/pingcap/tidb/ast"
-	"github.com/pingcap/tidb/model"
-	"github.com/pingcap/tidb/mysql"
+	"github.com/pingcap/parser/ast"
+	"github.com/pingcap/parser/model"
+	"github.com/pingcap/parser/mysql"
 	"github.com/pingcap/tidb/types"
 	"github.com/pingcap/tidb/util/mock"
 	"github.com/pingcap/tidb/util/testleak"
@@ -31,13 +31,13 @@ var _ = Suite(&testExpressionSuite{})
 
 type testExpressionSuite struct{}
 
-func newColumn(from int) *Column {
+func newColumn(id int) *Column {
 	return &Column{
-		FromID:  from,
-		ColName: model.NewCIStr(fmt.Sprint(from)),
-		TblName: model.NewCIStr("t"),
-		DBName:  model.NewCIStr("test"),
-		RetType: types.NewFieldType(mysql.TypeLonglong),
+		UniqueID: int64(id),
+		ColName:  model.NewCIStr(fmt.Sprint(id)),
+		TblName:  model.NewCIStr("t"),
+		DBName:   model.NewCIStr("test"),
+		RetType:  types.NewFieldType(mysql.TypeLonglong),
 	}
 }
 
@@ -113,6 +113,42 @@ func (*testExpressionSuite) TestConstantPropagation(c *C) {
 			},
 			result: "0",
 		},
+		{
+			conditions: []Expression{
+				newFunction(ast.EQ, newColumn(0), newColumn(1)),
+				newFunction(ast.In, newColumn(0), newLonglong(1), newLonglong(2)),
+				newFunction(ast.In, newColumn(1), newLonglong(3), newLonglong(4)),
+			},
+			result: "eq(test.t.0, test.t.1), in(test.t.0, 1, 2), in(test.t.0, 3, 4), in(test.t.1, 1, 2), in(test.t.1, 3, 4)",
+		},
+		{
+			conditions: []Expression{
+				newFunction(ast.EQ, newColumn(0), newColumn(1)),
+				newFunction(ast.EQ, newColumn(0), newFunction(ast.BitLength, newColumn(2))),
+			},
+			result: "eq(test.t.0, bit_length(cast(test.t.2))), eq(test.t.0, test.t.1), eq(test.t.1, bit_length(cast(test.t.2)))",
+		},
+		{
+			conditions: []Expression{
+				newFunction(ast.EQ, newColumn(0), newColumn(1)),
+				newFunction(ast.LE, newFunction(ast.Mul, newColumn(0), newColumn(0)), newLonglong(50)),
+			},
+			result: "eq(test.t.0, test.t.1), le(mul(test.t.0, test.t.0), 50), le(mul(test.t.1, test.t.1), 50)",
+		},
+		{
+			conditions: []Expression{
+				newFunction(ast.EQ, newColumn(0), newColumn(1)),
+				newFunction(ast.LE, newColumn(0), newFunction(ast.Plus, newColumn(1), newLonglong(1))),
+			},
+			result: "eq(test.t.0, test.t.1), le(test.t.0, plus(test.t.0, 1)), le(test.t.0, plus(test.t.1, 1)), le(test.t.1, plus(test.t.1, 1))",
+		},
+		{
+			conditions: []Expression{
+				newFunction(ast.EQ, newColumn(0), newColumn(1)),
+				newFunction(ast.LE, newColumn(0), newFunction(ast.Rand)),
+			},
+			result: "eq(test.t.0, test.t.1), le(cast(test.t.0), rand())",
+		},
 	}
 	for _, tt := range tests {
 		ctx := mock.NewContext()
@@ -164,5 +200,33 @@ func (*testExpressionSuite) TestConstantFolding(c *C) {
 	for _, tt := range tests {
 		newConds := FoldConstant(tt.condition)
 		c.Assert(newConds.String(), Equals, tt.result, Commentf("different for expr %s", tt.condition))
+	}
+}
+
+func (*testExpressionSuite) TestDeferredExprNullConstantFold(c *C) {
+	defer testleak.AfterTest(c)()
+	nullConst := &Constant{
+		Value:        types.NewDatum(nil),
+		RetType:      types.NewFieldType(mysql.TypeTiny),
+		DeferredExpr: Null,
+	}
+	tests := []struct {
+		condition Expression
+		deferred  string
+	}{
+		{
+			condition: newFunction(ast.LT, newColumn(0), nullConst),
+			deferred:  "lt(test.t.0, <nil>)",
+		},
+	}
+	for _, tt := range tests {
+		comment := Commentf("different for expr %s", tt.condition)
+		sf, ok := tt.condition.(*ScalarFunction)
+		c.Assert(ok, IsTrue, comment)
+		sf.GetCtx().GetSessionVars().StmtCtx.InNullRejectCheck = true
+		newConds := FoldConstant(tt.condition)
+		newConst, ok := newConds.(*Constant)
+		c.Assert(ok, IsTrue, comment)
+		c.Assert(newConst.DeferredExpr.String(), Equals, tt.deferred, comment)
 	}
 }

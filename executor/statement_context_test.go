@@ -18,8 +18,8 @@ import (
 	"unicode/utf8"
 
 	. "github.com/pingcap/check"
+	"github.com/pingcap/parser/terror"
 	"github.com/pingcap/tidb/table"
-	"github.com/pingcap/tidb/terror"
 	"github.com/pingcap/tidb/util/testkit"
 )
 
@@ -71,7 +71,7 @@ func (s *testSuite) TestStatementContext(c *C) {
 	tk.MustExec(strictModeSQL)
 	_, err = tk.Exec("insert sc2 values (unhex('4040ffff'))")
 	c.Assert(err, NotNil)
-	c.Assert(terror.ErrorEqual(err, table.ErrTruncateWrongValue), IsTrue)
+	c.Assert(terror.ErrorEqual(err, table.ErrTruncateWrongValue), IsTrue, Commentf("err %v", err))
 
 	tk.MustExec("set @@tidb_skip_utf8_check = '1'")
 	_, err = tk.Exec("insert sc2 values (unhex('4040ffff'))")

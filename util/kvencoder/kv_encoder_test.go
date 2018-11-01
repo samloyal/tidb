@@ -23,7 +23,6 @@ import (
 	"github.com/pingcap/tidb/meta/autoid"
 	"github.com/pingcap/tidb/store/mockstore"
 
-	"github.com/juju/errors"
 	. "github.com/pingcap/check"
 	"github.com/pingcap/tidb/domain"
 	"github.com/pingcap/tidb/kv"
@@ -35,6 +34,7 @@ import (
 	"github.com/pingcap/tidb/util/codec"
 	"github.com/pingcap/tidb/util/testkit"
 	"github.com/pingcap/tidb/util/testleak"
+	"github.com/pkg/errors"
 )
 
 var _ = Suite(&testKvEncoderSuite{})
@@ -49,6 +49,7 @@ func newStoreWithBootstrap() (kv.Storage, *domain.Domain, error) {
 		return nil, nil, errors.Trace(err)
 	}
 	session.SetSchemaLease(0)
+	session.SetStatsLease(0)
 	dom, err := session.BootstrapSession(store)
 	return store, dom, errors.Trace(err)
 }
@@ -284,7 +285,7 @@ func (s *testKvEncoderSuite) comparePrepareAndNormalEncode(c *C, alloc autoid.Al
 
 	stmtID, err := encoder.PrepareStmt(prepareFormat)
 	c.Assert(err, IsNil, Commentf(comment))
-	alloc.Rebase(tableID, baseID, false)
+	alloc.(*Allocator).Reset(baseID)
 	kvPairs, affectedRows, err := encoder.EncodePrepareStmt(tableID, stmtID, param...)
 	c.Assert(err, IsNil, Commentf(comment))
 	c.Assert(affectedRows, Equals, affectedRowsExpect, Commentf(comment))
@@ -365,7 +366,7 @@ func (s *testKvEncoderSuite) TestRetryWithAllocator(c *C) {
 		baseID := alloc.Base()
 		kvPairs, _, err1 := encoder.Encode(sql, tableID)
 		c.Assert(err1, IsNil, Commentf("sql:%s", sql))
-		alloc.Rebase(tableID, baseID, false)
+		alloc.Reset(baseID)
 		retryKvPairs, _, err1 := encoder.Encode(sql, tableID)
 		c.Assert(err1, IsNil, Commentf("sql:%s", sql))
 		c.Assert(len(kvPairs), Equals, len(retryKvPairs))
@@ -411,7 +412,7 @@ func (s *testKvEncoderSuite) TestRetryWithAllocator(c *C) {
 		baseID := alloc.Base()
 		kvPairs, _, err1 := encoder.Encode(sql, tableID)
 		c.Assert(err1, IsNil, Commentf("sql:%s", sql))
-		alloc.Rebase(tableID, baseID, false)
+		alloc.Reset(baseID)
 		retryKvPairs, _, err1 := encoder.Encode(sql, tableID)
 		c.Assert(err1, IsNil, Commentf("sql:%s", sql))
 		c.Assert(len(kvPairs), Equals, len(retryKvPairs))
@@ -433,8 +434,10 @@ func (s *testKvEncoderSuite) TestAllocatorRebase(c *C) {
 	alloc := NewAllocator()
 	var tableID int64 = 1
 	encoder, err := New("test", alloc)
+	c.Assert(err, IsNil)
 	err = alloc.Rebase(tableID, 100, false)
 	c.Assert(err, IsNil)
+	defer encoder.Close()
 	c.Assert(alloc.Base(), Equals, int64(100))
 
 	schemaSQL := `create table t(
@@ -455,6 +458,18 @@ func (s *testKvEncoderSuite) TestAllocatorRebase(c *C) {
 	sql = "insert into t(id, a) values(2000, 'test')"
 	encoder.Encode(sql, tableID)
 	c.Assert(alloc.Base(), Equals, int64(2000))
+}
+
+func (s *testKvEncoderSuite) TestAllocatorRebaseSmaller(c *C) {
+	alloc := NewAllocator()
+	alloc.Rebase(1, 10, false)
+	c.Assert(alloc.Base(), Equals, int64(10))
+	alloc.Rebase(1, 100, false)
+	c.Assert(alloc.Base(), Equals, int64(100))
+	alloc.Rebase(1, 1, false)
+	c.Assert(alloc.Base(), Equals, int64(100))
+	alloc.Reset(1)
+	c.Assert(alloc.Base(), Equals, int64(1))
 }
 
 func (s *testKvEncoderSuite) TestSimpleKeyEncode(c *C) {
@@ -654,4 +669,38 @@ func (s *testKvEncoderSuite) TestDisableStrictSQLMode(c *C) {
 	sql = "insert into `ORDER-LINE` values(2, 1, 1, 1, 1, 'NULL', 1, 1, 1, '1');"
 	_, _, err = encoder.Encode(sql, tableID)
 	c.Assert(err, IsNil)
+}
+
+func (s *testKvEncoderSuite) TestRefCount(c *C) {
+	var err error
+	var a [10]KvEncoder
+	for i := 0; i < 10; i++ {
+		a[i], err = New("test", nil)
+		c.Assert(err, IsNil)
+	}
+	dom1 := domGlobal
+	c.Assert(refCount, Equals, int64(10))
+	a[0].Close()
+	a[1].Close()
+	dom2 := domGlobal
+	c.Assert(refCount, Equals, int64(8))
+	c.Assert(dom1, Equals, dom2)
+
+	for i := 2; i < 9; i++ {
+		a[i].Close()
+	}
+	dom3 := domGlobal
+	c.Assert(refCount, Equals, int64(1))
+	c.Assert(dom3, Equals, dom2)
+
+	a[9].Close()
+	c.Assert(refCount, Equals, int64(0))
+
+	tmp, err := New("test", nil)
+	c.Assert(err, IsNil)
+	dom4 := domGlobal
+	c.Assert(dom4 == dom3, IsFalse)
+	c.Assert(refCount, Equals, int64(1))
+	tmp.Close()
+	c.Assert(refCount, Equals, int64(0))
 }

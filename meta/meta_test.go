@@ -14,12 +14,13 @@
 package meta_test
 
 import (
+	"math"
 	"testing"
 	"time"
 
 	. "github.com/pingcap/check"
+	"github.com/pingcap/parser/model"
 	"github.com/pingcap/tidb/meta"
-	"github.com/pingcap/tidb/model"
 	"github.com/pingcap/tidb/store/mockstore"
 	"github.com/pingcap/tidb/util/testleak"
 	"golang.org/x/net/context"
@@ -217,6 +218,7 @@ func (s *testSuite) TestMeta(c *C) {
 	err = t.SetSchemaDiff(schemaDiff)
 	c.Assert(err, IsNil)
 	readDiff, err := t.GetSchemaDiff(schemaDiff.Version)
+	c.Assert(err, IsNil)
 	c.Assert(readDiff, DeepEquals, schemaDiff)
 
 	err = txn.Commit(context.Background())
@@ -273,25 +275,43 @@ func (s *testSuite) TestDDL(c *C) {
 	c.Assert(err, IsNil)
 	c.Assert(n, Equals, int64(1))
 
-	v, err := t.GetDDLJob(0)
+	v, err := t.GetDDLJobByIdx(0)
 	c.Assert(err, IsNil)
 	c.Assert(v, DeepEquals, job)
-	v, err = t.GetDDLJob(1)
+	v, err = t.GetDDLJobByIdx(1)
 	c.Assert(err, IsNil)
 	c.Assert(v, IsNil)
 	job.ID = 2
 	err = t.UpdateDDLJob(0, job, true)
 	c.Assert(err, IsNil)
 
-	err = t.UpdateDDLReorgHandle(job, 1)
+	err = t.UpdateDDLReorgStartHandle(job, 1)
 	c.Assert(err, IsNil)
 
-	h, err := t.GetDDLReorgHandle(job)
+	i, j, k, err := t.GetDDLReorgHandle(job)
 	c.Assert(err, IsNil)
-	c.Assert(h, Equals, int64(1))
+	c.Assert(i, Equals, int64(1))
+	c.Assert(j, Equals, int64(math.MaxInt64))
+	c.Assert(k, Equals, int64(0))
+
+	err = t.UpdateDDLReorgHandle(job, 1, 2, 3)
+	c.Assert(err, IsNil)
+
+	i, j, k, err = t.GetDDLReorgHandle(job)
+	c.Assert(err, IsNil)
+	c.Assert(i, Equals, int64(1))
+	c.Assert(j, Equals, int64(2))
+	c.Assert(k, Equals, int64(3))
 
 	err = t.RemoveDDLReorgHandle(job)
 	c.Assert(err, IsNil)
+
+	i, j, k, err = t.GetDDLReorgHandle(job)
+	c.Assert(err, IsNil)
+	c.Assert(i, Equals, int64(0))
+	// The default value for endHandle is MaxInt64, not 0.
+	c.Assert(j, Equals, int64(math.MaxInt64))
+	c.Assert(k, Equals, int64(0))
 
 	v, err = t.DeQueueDDLJob()
 	c.Assert(err, IsNil)
@@ -311,12 +331,13 @@ func (s *testSuite) TestDDL(c *C) {
 		lastID = job.ID
 	}
 
-	// Test GetAllDDLJobs.
+	// Test GetAllDDLJobsInQueue.
 	err = t.EnQueueDDLJob(job)
+	c.Assert(err, IsNil)
 	job1 := &model.Job{ID: 2}
 	err = t.EnQueueDDLJob(job1)
 	c.Assert(err, IsNil)
-	jobs, err := t.GetAllDDLJobs()
+	jobs, err := t.GetAllDDLJobsInQueue()
 	c.Assert(err, IsNil)
 	expectJobs := []*model.Job{job, job1}
 	c.Assert(jobs, DeepEquals, expectJobs)

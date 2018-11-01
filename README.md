@@ -2,13 +2,13 @@
 
 [![Build Status](https://travis-ci.org/pingcap/tidb.svg?branch=master)](https://travis-ci.org/pingcap/tidb)
 [![Go Report Card](https://goreportcard.com/badge/github.com/pingcap/tidb)](https://goreportcard.com/report/github.com/pingcap/tidb)
-![Project Status](https://img.shields.io/badge/version-2.0-green.svg)
+![GitHub release](https://img.shields.io/github/release/pingcap/tidb.svg)
 [![CircleCI Status](https://circleci.com/gh/pingcap/tidb.svg?style=shield)](https://circleci.com/gh/pingcap/tidb)
 [![Coverage Status](https://coveralls.io/repos/github/pingcap/tidb/badge.svg?branch=master)](https://coveralls.io/github/pingcap/tidb?branch=master)
 
 ## What is TiDB?
 
-TiDB (The pronunciation is: /'taɪdiːbi:/ tai-D-B, etymology: titanium) is an open source distributed scalable Hybrid Transactional and Analytical Processing (HTAP) database built by PingCAP. Inspired by the design of Google F1 and Google Spanner, TiDB features infinite horizontal scalability, strong consistency, and high availability. The goal of TiDB is to serve as a one-stop solution for both OLTP (Online Transactional Processing) and OLAP (Online Analytical Processing).
+TiDB (The pronunciation is: /'taɪdiːbi:/ tai-D-B, etymology: titanium) is an open-source distributed scalable Hybrid Transactional and Analytical Processing (HTAP) database. It features infinite horizontal scalability, strong consistency, and high availability. TiDB is MySQL compatible and serves as a one-stop data warehouse for both OLTP (Online Transactional Processing) and OLAP (Online Analytical Processing) workloads.
 
 - __Horizontal scalability__
 
@@ -34,19 +34,19 @@ TiDB (The pronunciation is: /'taɪdiːbi:/ tai-D-B, etymology: titanium) is an o
 
     With TiDB, your data and applications are always on and continuously available, so your users are never disappointed.
 
-For more details, see [How we build TiDB](https://pingcap.github.io/blog/2016/10/17/how-we-build-tidb/).
+For more details, see [How we build TiDB](https://pingcap.com/blog/2016-10-17-how-we-build-tidb/).
 
 ## Adopters
 
-You can view the list of TiDB adopters [here](https://github.com/pingcap/docs/blob/master/adopters.md).
+You can view the list of TiDB adopters [here](https://pingcap.com/docs/adopters/).
 
 ## Roadmap
 
-Read the [Roadmap](https://github.com/pingcap/docs/blob/master/ROADMAP.md).
+Read the [Roadmap](https://pingcap.com/docs/ROADMAP).
 
 ## Quick start
 
-Read the [Quick Start](https://pingcap.com/doc-QUICKSTART).
+Read the [Quick Start](https://pingcap.com/docs/QUICKSTART).
 
 ## Documentation
 
@@ -63,6 +63,7 @@ for details on submitting patches and the contribution workflow.
 
 ## Connect with us
 
+- [**Contact PingCAP Team**](http://bit.ly/contact_us_via_github)
 - **Twitter**: [@PingCAP](https://twitter.com/PingCAP)
 - **Reddit**: https://www.reddit.com/r/TiDB/
 - **Stack Overflow**: https://stackoverflow.com/questions/tagged/tidb
